@@ -368,14 +368,6 @@ static int get_tensor_i64(OrtTdt *ort, OrtValue *value, int64_t **data_out) {
 
 static int encoder_run(OrtTdt *ort, const SttFeatures *features, OrtValue **encoded_out, int64_t *encoded_len_out, long long *elapsed_ms_out) {
   long long start_ms = stt_now_ms();
-  float *input = calloc(features->valid_frames * TDT_FEATURE_BINS, sizeof(*input));
-  if (!input) return -1;
-  for (size_t t = 0; t < features->valid_frames; ++t) {
-    for (size_t b = 0; b < TDT_FEATURE_BINS; ++b) {
-      input[b * features->valid_frames + t] = features->data[t * TDT_FEATURE_BINS + b];
-    }
-  }
-
   int64_t length = (int64_t)features->valid_frames;
   int64_t input_shape[] = {1, TDT_FEATURE_BINS, (int64_t)features->valid_frames};
   int64_t length_shape[] = {1};
@@ -385,7 +377,7 @@ static int encoder_run(OrtTdt *ort, const SttFeatures *features, OrtValue **enco
   const char *output_names[] = {"outputs", "encoded_lengths"};
   int rc = -1;
 
-  if (make_tensor(ort, input, features->valid_frames * TDT_FEATURE_BINS * sizeof(*input), input_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inputs[0]) != 0) goto done;
+  if (make_tensor(ort, features->data, features->valid_frames * TDT_FEATURE_BINS * sizeof(*features->data), input_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inputs[0]) != 0) goto done;
   if (make_tensor(ort, &length, sizeof(length), length_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &inputs[1]) != 0) goto done;
   if (ort_check(ort, ort->api->Run(ort->encoder, NULL, input_names, (const OrtValue *const *)inputs, 2, output_names, 2, outputs), "Run encoder") != 0) goto done;
 
@@ -401,7 +393,6 @@ done:
   if (outputs[1]) ort->api->ReleaseValue(outputs[1]);
   if (inputs[0]) ort->api->ReleaseValue(inputs[0]);
   if (inputs[1]) ort->api->ReleaseValue(inputs[1]);
-  free(input);
   if (elapsed_ms_out) *elapsed_ms_out = stt_now_ms() - start_ms;
   return rc;
 }
@@ -427,7 +418,8 @@ static int decoder_step(OrtTdt *ort,
                         const float *state2,
                         float *next_state1,
                         float *next_state2,
-                        float logits_out[TDT_VOCAB_SIZE + TDT_DURATION_COUNT]) {
+                        int *token_out,
+                        int *duration_out) {
   float encoder_slice[TDT_ENCODER_DIM];
   for (size_t d = 0; d < TDT_ENCODER_DIM; ++d) encoder_slice[d] = encoder[d * encoded_len + frame];
 
@@ -450,14 +442,19 @@ static int decoder_step(OrtTdt *ort,
   if (ort_check(ort, ort->api->Run(ort->decoder, NULL, input_names, (const OrtValue *const *)inputs, 5, output_names, 4, outputs), "Run decoder") != 0) goto done;
 
   float *logits = NULL;
-  float *out_state1 = NULL;
-  float *out_state2 = NULL;
   if (get_tensor_data(ort, outputs[0], &logits) != 0) goto done;
-  if (get_tensor_data(ort, outputs[2], &out_state1) != 0) goto done;
-  if (get_tensor_data(ort, outputs[3], &out_state2) != 0) goto done;
-  memcpy(logits_out, logits, (TDT_VOCAB_SIZE + TDT_DURATION_COUNT) * sizeof(*logits_out));
-  memcpy(next_state1, out_state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state1));
-  memcpy(next_state2, out_state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state2));
+  int token = argmax(logits, TDT_VOCAB_SIZE);
+  int duration = argmax(logits + TDT_VOCAB_SIZE, TDT_DURATION_COUNT);
+  if (token != TDT_BLANK_ID) {
+    float *out_state1 = NULL;
+    float *out_state2 = NULL;
+    if (get_tensor_data(ort, outputs[2], &out_state1) != 0) goto done;
+    if (get_tensor_data(ort, outputs[3], &out_state2) != 0) goto done;
+    memcpy(next_state1, out_state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state1));
+    memcpy(next_state2, out_state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state2));
+  }
+  *token_out = token;
+  *duration_out = duration;
   rc = 0;
 
 done:
@@ -485,14 +482,12 @@ static int tdt_greedy_decode_onnx(OrtTdt *ort, OrtValue *encoded_value, int64_t 
   memset(stats, 0, sizeof(*stats));
 
   for (int64_t t = 0; t < encoded_len;) {
-    float logits[TDT_VOCAB_SIZE + TDT_DURATION_COUNT];
+    int token = TDT_BLANK_ID;
+    int duration = 0;
     long long step_start_ms = stt_now_ms();
-    if (decoder_step(ort, encoder, encoded_len, t, target, state1, state2, next_state1, next_state2, logits) != 0) goto fail;
+    if (decoder_step(ort, encoder, encoded_len, t, target, state1, state2, next_state1, next_state2, &token, &duration) != 0) goto fail;
     stats->decoder_ms += stt_now_ms() - step_start_ms;
     stats->decoder_calls++;
-
-    int token = argmax(logits, TDT_VOCAB_SIZE);
-    int duration = argmax(logits + TDT_VOCAB_SIZE, TDT_DURATION_COUNT);
 
     if (token != TDT_BLANK_ID) {
       if (push_id(&ids, &id_count, &id_cap, token) != 0) goto fail;

@@ -174,7 +174,7 @@ static int transcribe_queue_push(TranscribeQueue *queue,
                                  long long commit_ms,
                                  SttAudioBuffer *audio,
                                  size_t *depth_out) {
-  TranscribeJob *job = calloc(1, sizeof(*job));
+  TranscribeJob *job = malloc(sizeof(*job));
   if (!job) return -1;
   job->audio = *audio;
   stt_audio_buffer_init(audio);
@@ -182,6 +182,7 @@ static int transcribe_queue_push(TranscribeQueue *queue,
   job->release_ms = release_ms;
   job->commit_ms = commit_ms;
   job->enqueue_ms = stt_now_ms();
+  job->next = NULL;
 
   pthread_mutex_lock(&queue->mutex);
   if (queue->tail) queue->tail->next = job;

@@ -6,7 +6,6 @@
 
 typedef struct {
   float *data;
-  unsigned char *mask;
   size_t frames;
   size_t valid_frames;
   size_t bins;

@@ -59,20 +59,32 @@ static int append_samples(SttAudioBuffer *buf, const int16_t *samples, size_t n,
 
 static void remember_pre_roll(SttRecorder *rec, const int16_t *samples, size_t n) {
   if (!rec->pre || rec->pre_cap == 0) return;
-  for (size_t i = 0; i < n; ++i) {
-    rec->pre[rec->pre_pos] = samples[i];
-    rec->pre_pos = (rec->pre_pos + 1) % rec->pre_cap;
-    if (rec->pre_len < rec->pre_cap) rec->pre_len++;
+  if (n >= rec->pre_cap) {
+    memcpy(rec->pre, samples + (n - rec->pre_cap), rec->pre_cap * sizeof(*samples));
+    rec->pre_pos = 0;
+    rec->pre_len = rec->pre_cap;
+    return;
+  }
+  size_t offset = 0;
+  while (offset < n) {
+    size_t chunk = rec->pre_cap - rec->pre_pos;
+    if (chunk > n - offset) chunk = n - offset;
+    memcpy(rec->pre + rec->pre_pos, samples + offset, chunk * sizeof(*samples));
+    rec->pre_pos = (rec->pre_pos + chunk) % rec->pre_cap;
+    rec->pre_len += chunk;
+    if (rec->pre_len > rec->pre_cap) rec->pre_len = rec->pre_cap;
+    offset += chunk;
   }
 }
 
 static int copy_pre_roll(SttRecorder *rec) {
   if (!rec->pre || rec->pre_len == 0) return 0;
   size_t start = rec->pre_len == rec->pre_cap ? rec->pre_pos : 0;
-  for (size_t i = 0; i < rec->pre_len; ++i) {
-    int16_t sample = rec->pre[(start + i) % rec->pre_cap];
-    if (append_samples(&rec->capture, &sample, 1, (size_t)rec->max_samples) != 0) return -1;
-  }
+  size_t first = rec->pre_cap - start;
+  if (first > rec->pre_len) first = rec->pre_len;
+  if (append_samples(&rec->capture, rec->pre + start, first, (size_t)rec->max_samples) != 0) return -1;
+  size_t remaining = rec->pre_len - first;
+  if (remaining > 0 && append_samples(&rec->capture, rec->pre, remaining, (size_t)rec->max_samples) != 0) return -1;
   return 0;
 }
 
@@ -218,14 +230,10 @@ int stt_recorder_commit(SttRecorder *rec, SttAudioBuffer *out) {
   out->sample_rate = rec->sample_rate;
   out->channels = 1;
   if (rec->capture.len > 0) {
-    out->samples = malloc(rec->capture.len * sizeof(*out->samples));
-    if (!out->samples) {
-      pthread_mutex_unlock(&rec->mutex);
-      return -1;
-    }
-    memcpy(out->samples, rec->capture.samples, rec->capture.len * sizeof(*out->samples));
-    out->len = rec->capture.len;
-    out->cap = rec->capture.len;
+    *out = rec->capture;
+    stt_audio_buffer_init(&rec->capture);
+    rec->capture.sample_rate = rec->sample_rate;
+    rec->capture.channels = 1;
   }
   double seconds = out->len / (double)out->sample_rate;
   pthread_mutex_unlock(&rec->mutex);
