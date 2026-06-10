@@ -8,6 +8,7 @@
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,13 @@
 #include <unistd.h>
 
 #define MAX_KEY_CODE 255
+
+typedef struct {
+  int pipe_fds[2];
+  struct sigaction old_int;
+  struct sigaction old_term;
+  struct sigaction old_hup;
+} SignalState;
 
 typedef struct {
   int fd;
@@ -37,6 +45,73 @@ typedef struct {
   int v_down;
   int hotkey_down;
 } HotkeyState;
+
+static int g_signal_pipe_write = -1;
+static volatile sig_atomic_t g_stop_requested;
+
+static void handle_stop_signal(int signo) {
+  (void)signo;
+  g_stop_requested = 1;
+  if (g_signal_pipe_write >= 0) {
+    unsigned char byte = 1;
+    write(g_signal_pipe_write, &byte, sizeof(byte));
+  }
+}
+
+static int set_nonblocking_cloexec(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+  flags = fcntl(fd, F_GETFD, 0);
+  if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return -1;
+  return 0;
+}
+
+static int install_stop_signals(SignalState *signals) {
+  signals->pipe_fds[0] = -1;
+  signals->pipe_fds[1] = -1;
+  g_stop_requested = 0;
+
+  if (pipe(signals->pipe_fds) != 0) return -1;
+  if (set_nonblocking_cloexec(signals->pipe_fds[0]) != 0 ||
+      set_nonblocking_cloexec(signals->pipe_fds[1]) != 0) {
+    close(signals->pipe_fds[0]);
+    close(signals->pipe_fds[1]);
+    signals->pipe_fds[0] = -1;
+    signals->pipe_fds[1] = -1;
+    return -1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = handle_stop_signal;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGINT, &action, &signals->old_int) != 0 ||
+      sigaction(SIGTERM, &action, &signals->old_term) != 0 ||
+      sigaction(SIGHUP, &action, &signals->old_hup) != 0) {
+    close(signals->pipe_fds[0]);
+    close(signals->pipe_fds[1]);
+    signals->pipe_fds[0] = -1;
+    signals->pipe_fds[1] = -1;
+    return -1;
+  }
+
+  g_signal_pipe_write = signals->pipe_fds[1];
+  return 0;
+}
+
+static void restore_stop_signals(SignalState *signals) {
+  sigaction(SIGINT, &signals->old_int, NULL);
+  sigaction(SIGTERM, &signals->old_term, NULL);
+  sigaction(SIGHUP, &signals->old_hup, NULL);
+  g_signal_pipe_write = -1;
+  if (signals->pipe_fds[0] >= 0) close(signals->pipe_fds[0]);
+  if (signals->pipe_fds[1] >= 0) close(signals->pipe_fds[1]);
+}
+
+static void drain_signal_pipe(int fd) {
+  unsigned char buf[32];
+  while (read(fd, buf, sizeof(buf)) > 0) {}
+}
 
 static int is_super_key(unsigned short code) {
   return code == KEY_LEFTMETA || code == KEY_RIGHTMETA;
@@ -248,44 +323,66 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
 }
 
 int stt_hotkey_loop(SttHotkeyCallback cb, void *user) {
+  SignalState signals;
+  if (install_stop_signals(&signals) != 0) {
+    LOG_ERROR("hotkey: failed to install signal handlers: %s\n", strerror(errno));
+    return -1;
+  }
+
   Keyboards keyboards;
-  if (discover_keyboards(&keyboards) != 0) return -1;
+  if (discover_keyboards(&keyboards) != 0) {
+    restore_stop_signals(&signals);
+    return -1;
+  }
   if (grab_keyboards(&keyboards) != 0) {
     close_keyboards(&keyboards);
+    restore_stop_signals(&signals);
     return -1;
   }
 
   int uinput_fd = open_virtual_keyboard();
   if (uinput_fd < 0) {
     close_keyboards(&keyboards);
+    restore_stop_signals(&signals);
     return -1;
   }
 
-  struct pollfd *pollfds = calloc(keyboards.len, sizeof(*pollfds));
+  struct pollfd *pollfds = calloc(keyboards.len + 1, sizeof(*pollfds));
   if (!pollfds) {
     ioctl(uinput_fd, UI_DEV_DESTROY);
     close(uinput_fd);
     close_keyboards(&keyboards);
+    restore_stop_signals(&signals);
     return -1;
   }
-  for (size_t i = 0; i < keyboards.len; ++i) pollfds[i].fd = keyboards.items[i].fd;
+  pollfds[0].fd = signals.pipe_fds[0];
+  for (size_t i = 0; i < keyboards.len; ++i) pollfds[i + 1].fd = keyboards.items[i].fd;
 
   HotkeyState state = {0};
-  for (;;) {
+  int loop_rc = -1;
+  while (!g_stop_requested) {
+    pollfds[0].events = POLLIN;
+    pollfds[0].revents = 0;
     for (size_t i = 0; i < keyboards.len; ++i) {
-      pollfds[i].events = keyboards.items[i].fd >= 0 ? POLLIN : 0;
-      pollfds[i].revents = 0;
+      pollfds[i + 1].events = keyboards.items[i].fd >= 0 ? POLLIN : 0;
+      pollfds[i + 1].revents = 0;
     }
 
-    int rc = poll(pollfds, keyboards.len, -1);
+    int rc = poll(pollfds, keyboards.len + 1, -1);
     if (rc < 0) {
       if (errno == EINTR) continue;
       LOG_ERROR("hotkey: poll failed: %s\n", strerror(errno));
       break;
     }
 
+    if (pollfds[0].revents & POLLIN) {
+      drain_signal_pipe(signals.pipe_fds[0]);
+      loop_rc = 0;
+      break;
+    }
+
     for (size_t i = 0; i < keyboards.len; ++i) {
-      if (!(pollfds[i].revents & POLLIN)) continue;
+      if (!(pollfds[i + 1].revents & POLLIN)) continue;
 
       for (;;) {
         struct input_event ev;
@@ -310,9 +407,11 @@ int stt_hotkey_loop(SttHotkeyCallback cb, void *user) {
     }
   }
 
+  if (g_stop_requested) loop_rc = 0;
   free(pollfds);
   ioctl(uinput_fd, UI_DEV_DESTROY);
   close(uinput_fd);
   close_keyboards(&keyboards);
-  return -1;
+  restore_stop_signals(&signals);
+  return loop_rc;
 }
