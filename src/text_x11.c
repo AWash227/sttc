@@ -47,7 +47,27 @@ static KeySym keysym_for_ascii(char c, int *shift) {
   }
 }
 
-int stt_type_text_x11(const char *text, int delay_ms) {
+static int type_ascii_char(Display *dpy, KeyCode shift, char c, int delay_ms) {
+  int need_shift = 0;
+  KeySym sym = keysym_for_ascii(c, &need_shift);
+  if (sym == NoSymbol) return 0;
+  KeyCode code = XKeysymToKeycode(dpy, sym);
+  if (!code) return 0;
+  if (need_shift) XTestFakeKeyEvent(dpy, shift, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, code, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, code, False, CurrentTime);
+  if (need_shift) XTestFakeKeyEvent(dpy, shift, False, CurrentTime);
+  if (delay_ms > 0) {
+    XFlush(dpy);
+    struct timespec ts;
+    ts.tv_sec = delay_ms / 1000;
+    ts.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+  }
+  return 0;
+}
+
+int stt_type_phrase_x11(const char *text, int delay_ms) {
   Display *dpy = XOpenDisplay(NULL);
   if (!dpy) {
     LOG_ERROR("failed to open X display\n");
@@ -67,22 +87,11 @@ int stt_type_text_x11(const char *text, int delay_ms) {
       XCloseDisplay(dpy);
       return -1;
     }
-    int need_shift = 0;
-    KeySym sym = keysym_for_ascii((char)*p, &need_shift);
-    if (sym == NoSymbol) continue;
-    KeyCode code = XKeysymToKeycode(dpy, sym);
-    if (!code) continue;
-    if (need_shift) XTestFakeKeyEvent(dpy, shift, True, CurrentTime);
-    XTestFakeKeyEvent(dpy, code, True, CurrentTime);
-    XTestFakeKeyEvent(dpy, code, False, CurrentTime);
-    if (need_shift) XTestFakeKeyEvent(dpy, shift, False, CurrentTime);
-    if (delay_ms > 0) {
-      XFlush(dpy);
-      struct timespec ts;
-      ts.tv_sec = delay_ms / 1000;
-      ts.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
-      nanosleep(&ts, NULL);
-    }
+    type_ascii_char(dpy, shift, (char)*p, delay_ms);
+  }
+  size_t len = strlen(text);
+  if (len > 0 && !isspace((unsigned char)text[len - 1])) {
+    type_ascii_char(dpy, shift, ' ', delay_ms);
   }
   XFlush(dpy);
   XCloseDisplay(dpy);

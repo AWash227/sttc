@@ -32,6 +32,8 @@ cmake --build build
 ./build/stt run --dry-run
 ```
 
+With no subcommand, `stt` runs the dictation loop with the same defaults as `stt run`.
+
 `run` grabs `/dev/input/by-id/*-event-kbd` and creates a `/dev/uinput` passthrough keyboard so the hotkey works even when virt-manager has focus. If automatic keyboard discovery is wrong, set:
 
 ```sh

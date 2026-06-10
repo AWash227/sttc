@@ -25,10 +25,10 @@ static int parse_int(const char *s, int *out) {
 
 int stt_parse_args(int argc, char **argv, SttOptions *opts) {
   options_defaults(opts);
-  if (argc < 2) return -1;
-  if (strcmp(argv[1], "run") != 0) return -1;
+  int arg_start = 1;
+  if (argc >= 2 && strcmp(argv[1], "run") == 0) arg_start = 2;
 
-  for (int i = 2; i < argc; ++i) {
+  for (int i = arg_start; i < argc; ++i) {
     if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
       opts->model_dir = argv[++i];
     } else if (strcmp(argv[i], "--hotkey") == 0 && i + 1 < argc) {
@@ -55,6 +55,6 @@ int stt_parse_args(int argc, char **argv, SttOptions *opts) {
 void stt_print_usage(const char *argv0) {
   fprintf(stderr,
           "usage:\n"
-          "  %s run [--model-dir DIR] [--hotkey Super+V] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
+          "  %s [run] [--model-dir DIR] [--hotkey Super+V] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
           argv0);
 }

@@ -9,10 +9,8 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <time.h>
 
 typedef struct TranscribeJob {
@@ -53,14 +51,6 @@ static size_t transcribe_queue_depth(TranscribeQueue *queue) {
   size_t depth = queue->depth;
   pthread_mutex_unlock(&queue->mutex);
   return depth;
-}
-
-static void type_phrase(const char *text, int delay_ms) {
-  stt_type_text_x11(text, delay_ms);
-  size_t len = strlen(text);
-  if (len > 0 && !isspace((unsigned char)text[len - 1])) {
-    stt_type_text_x11(" ", delay_ms);
-  }
 }
 
 static void *transcribe_worker(void *arg) {
@@ -105,7 +95,7 @@ static void *transcribe_worker(void *arg) {
           LOG_DEBUG("run: capture=%llu type_wait elapsed_ms=%lld reason=recording_active\n", job->capture_id, type_wait_ms);
         }
         long long type_start_ms = stt_now_ms();
-        type_phrase(text, queue->opts->type_delay_ms);
+        stt_type_phrase_x11(text, queue->opts->type_delay_ms);
         type_ms = stt_now_ms() - type_start_ms;
         LOG_DEBUG("run: capture=%llu type elapsed_ms=%lld\n", job->capture_id, type_ms);
       }
@@ -207,7 +197,7 @@ static int transcribe_queue_push(TranscribeQueue *queue,
 static void on_hotkey(int pressed, void *user) {
   RunState *state = user;
   unsigned long long event_id = ++state->event_seq;
-  size_t queue_depth = transcribe_queue_depth(state->queue);
+  size_t queue_depth = stt_log_enabled(STT_LOG_TRACE) ? transcribe_queue_depth(state->queue) : 0;
   LOG_TRACE("run: hotkey_event=%llu t_ms=%lld pressed=%d queue_depth=%zu recording=%d\n",
             event_id, stt_now_ms(), pressed, queue_depth, state->recording);
   if (pressed) {
