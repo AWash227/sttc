@@ -5,14 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void options_defaults(SttOptions *opts) {
-  memset(opts, 0, sizeof(*opts));
-  opts->model_dir = "~/.models/parakeet-tdt";
-  opts->hotkey = "Super+V";
-  opts->type_delay_ms = 0;
-  opts->max_audio_sec = 25;
-  opts->pre_roll_ms = 350;
-  opts->post_roll_ms = 0;
+static void config_defaults(SttConfig *config) {
+  memset(config, 0, sizeof(*config));
+  config->model_dir = "~/.models/parakeet-tdt";
+  config->type_delay_ms = 0;
+  config->max_audio_sec = 25;
+  config->pre_roll_ms = 350;
+  config->post_roll_ms = 0;
 }
 
 static int parse_int(const char *s, int *out) {
@@ -23,28 +22,26 @@ static int parse_int(const char *s, int *out) {
   return 0;
 }
 
-int stt_parse_args(int argc, char **argv, SttOptions *opts) {
-  options_defaults(opts);
+int stt_parse_args(int argc, char **argv, SttConfig *config) {
+  config_defaults(config);
   int arg_start = 1;
   if (argc >= 2 && strcmp(argv[1], "run") == 0) arg_start = 2;
 
   for (int i = arg_start; i < argc; ++i) {
     if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
-      opts->model_dir = argv[++i];
-    } else if (strcmp(argv[i], "--hotkey") == 0 && i + 1 < argc) {
-      opts->hotkey = argv[++i];
+      config->model_dir = argv[++i];
     } else if (strcmp(argv[i], "--type-delay-ms") == 0 && i + 1 < argc) {
-      if (parse_int(argv[++i], &opts->type_delay_ms) != 0) return -1;
+      if (parse_int(argv[++i], &config->type_delay_ms) != 0) return -1;
     } else if (strcmp(argv[i], "--max-audio-sec") == 0 && i + 1 < argc) {
-      if (parse_int(argv[++i], &opts->max_audio_sec) != 0) return -1;
+      if (parse_int(argv[++i], &config->max_audio_sec) != 0) return -1;
     } else if (strcmp(argv[i], "--pre-roll-ms") == 0 && i + 1 < argc) {
-      if (parse_int(argv[++i], &opts->pre_roll_ms) != 0) return -1;
+      if (parse_int(argv[++i], &config->pre_roll_ms) != 0) return -1;
     } else if (strcmp(argv[i], "--post-roll-ms") == 0 && i + 1 < argc) {
-      if (parse_int(argv[++i], &opts->post_roll_ms) != 0) return -1;
+      if (parse_int(argv[++i], &config->post_roll_ms) != 0) return -1;
     } else if (strcmp(argv[i], "--dry-run") == 0) {
-      opts->dry_run = 1;
+      config->dry_run = 1;
     } else if (strcmp(argv[i], "--print") == 0) {
-      opts->print_only = 1;
+      config->print_only = 1;
     } else {
       return -1;
     }
@@ -55,6 +52,6 @@ int stt_parse_args(int argc, char **argv, SttOptions *opts) {
 void stt_print_usage(const char *argv0) {
   fprintf(stderr,
           "usage:\n"
-          "  %s [run] [--model-dir DIR] [--hotkey Super+V] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
+          "  %s [run] [--model-dir DIR] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
           argv0);
 }

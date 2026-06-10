@@ -247,12 +247,7 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
   return pass;
 }
 
-int stt_hotkey_loop(const char *hotkey, SttHotkeyCallback cb, void *user) {
-  if (strcmp(hotkey, "Super+V") != 0 && strcmp(hotkey, "Mod4+V") != 0) {
-    LOG_ERROR("hotkey: only Super+V is supported in this build\n");
-    return -1;
-  }
-
+int stt_hotkey_loop(SttHotkeyCallback cb, void *user) {
   Keyboards keyboards;
   if (discover_keyboards(&keyboards) != 0) return -1;
   if (grab_keyboards(&keyboards) != 0) {

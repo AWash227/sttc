@@ -59,7 +59,7 @@ The current default dictation model directory is:
 The planned dictation command is:
 
 ```sh
-./build/stt run --hotkey Super+V --type-delay-ms 0 --pre-roll-ms 350 --post-roll-ms 0
+./build/stt --type-delay-ms 0 --pre-roll-ms 350 --post-roll-ms 0
 ```
 
 Typing defaults to `--type-delay-ms 0`. If a target application drops synthetic key events, add a small delay such as `--type-delay-ms 5`.

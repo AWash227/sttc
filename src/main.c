@@ -28,7 +28,7 @@ typedef struct {
   pthread_t thread;
   TranscribeJob *head;
   TranscribeJob *tail;
-  const SttOptions *opts;
+  const SttConfig *config;
   SttModel *model;
   atomic_int recording;
   size_t depth;
@@ -37,7 +37,7 @@ typedef struct {
 } TranscribeQueue;
 
 typedef struct {
-  const SttOptions *opts;
+  const SttConfig *config;
   SttRecorder *recorder;
   TranscribeQueue *queue;
   int recording;
@@ -81,7 +81,7 @@ static void *transcribe_worker(void *arg) {
     LOG_DEBUG("run: capture=%llu transcribe rc=%d elapsed_ms=%lld\n", job->capture_id, rc, transcribe_ms);
     LOG_INFO("transcript: \"%s\"\n", text ? text : "");
     if (text && text[0]) {
-      if (queue->opts->print_only || queue->opts->dry_run) {
+      if (queue->config->print_only || queue->config->dry_run) {
         printf("%s\n", text);
         fflush(stdout);
       } else {
@@ -95,7 +95,7 @@ static void *transcribe_worker(void *arg) {
           LOG_DEBUG("run: capture=%llu type_wait elapsed_ms=%lld reason=recording_active\n", job->capture_id, type_wait_ms);
         }
         long long type_start_ms = stt_now_ms();
-        stt_type_phrase_x11(text, queue->opts->type_delay_ms);
+        stt_type_phrase_x11(text, queue->config->type_delay_ms);
         type_ms = stt_now_ms() - type_start_ms;
         LOG_DEBUG("run: capture=%llu type elapsed_ms=%lld\n", job->capture_id, type_ms);
       }
@@ -128,11 +128,11 @@ static void *transcribe_worker(void *arg) {
   }
 }
 
-static int transcribe_queue_start(TranscribeQueue *queue, const SttOptions *opts, SttModel *model) {
+static int transcribe_queue_start(TranscribeQueue *queue, const SttConfig *config, SttModel *model) {
   *queue = (TranscribeQueue){
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
-    .opts = opts,
+    .config = config,
     .model = model,
   };
   atomic_init(&queue->recording, 0);
@@ -232,7 +232,7 @@ static void on_hotkey(int pressed, void *user) {
   LOG_DEBUG("run: capture=%llu commit rc=%d elapsed_ms=%lld samples=%zu\n",
             capture_id, commit_rc, commit_ms, audio.len);
 
-  size_t min_samples = (size_t)(16000 * (state->opts->pre_roll_ms + 250) / 1000);
+  size_t min_samples = (size_t)(STT_SAMPLE_RATE * (state->config->pre_roll_ms + 250) / 1000);
   if (commit_rc != 0 || audio.len <= min_samples) {
     LOG_INFO("run: capture=%llu discarded reason=%s held_ms=%lld samples=%zu min_samples=%zu\n",
              capture_id, commit_rc != 0 ? "commit_failed" : "too_short_or_preroll_only", held_ms, audio.len, min_samples);
@@ -253,16 +253,16 @@ static void on_hotkey(int pressed, void *user) {
 }
 
 int main(int argc, char **argv) {
-  SttOptions opts;
-  if (stt_parse_args(argc, argv, &opts) != 0) {
+  SttConfig config;
+  if (stt_parse_args(argc, argv, &config) != 0) {
     stt_print_usage(argv[0]);
     return 2;
   }
 
   SttModel *model = NULL;
-  if (stt_model_load(&model, opts.model_dir) != 0) return 1;
+  if (stt_model_load(&model, config.model_dir) != 0) return 1;
   SttRecorder *recorder = NULL;
-  if (stt_recorder_open(&recorder, 16000, opts.max_audio_sec, opts.pre_roll_ms, opts.post_roll_ms) != 0) {
+  if (stt_recorder_open(&recorder, &config) != 0) {
     stt_model_free(model);
     return 1;
   }
@@ -275,13 +275,13 @@ int main(int argc, char **argv) {
     return 1;
   }
   TranscribeQueue queue;
-  if (transcribe_queue_start(&queue, &opts, model) != 0) {
+  if (transcribe_queue_start(&queue, &config, model) != 0) {
     stt_recorder_close(recorder);
     stt_model_free(model);
     return 1;
   }
-  RunState state = {.opts = &opts, .recorder = recorder, .queue = &queue};
-  int rc = stt_hotkey_loop(opts.hotkey, on_hotkey, &state);
+  RunState state = {.config = &config, .recorder = recorder, .queue = &queue};
+  int rc = stt_hotkey_loop(on_hotkey, &state);
   transcribe_queue_stop(&queue);
   stt_recorder_close(recorder);
   stt_model_free(model);

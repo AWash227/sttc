@@ -124,15 +124,15 @@ static void *record_thread(void *arg) {
   return NULL;
 }
 
-int stt_recorder_open(SttRecorder **out, int sample_rate, int max_seconds, int pre_roll_ms, int post_roll_ms) {
+int stt_recorder_open(SttRecorder **out, const SttConfig *config) {
   SttRecorder *rec = calloc(1, sizeof(*rec));
   if (!rec) return -1;
-  rec->sample_rate = sample_rate;
-  rec->max_samples = sample_rate * max_seconds;
-  rec->pre_roll_samples = sample_rate * pre_roll_ms / 1000;
-  rec->post_roll_samples = sample_rate * post_roll_ms / 1000;
+  rec->sample_rate = STT_SAMPLE_RATE;
+  rec->max_samples = STT_SAMPLE_RATE * config->max_audio_sec;
+  rec->pre_roll_samples = STT_SAMPLE_RATE * config->pre_roll_ms / 1000;
+  rec->post_roll_samples = STT_SAMPLE_RATE * config->post_roll_ms / 1000;
   stt_audio_buffer_init(&rec->capture);
-  rec->capture.sample_rate = sample_rate;
+  rec->capture.sample_rate = STT_SAMPLE_RATE;
   rec->pre_cap = (size_t)rec->pre_roll_samples;
   if (rec->pre_cap > 0) {
     rec->pre = calloc(rec->pre_cap, sizeof(*rec->pre));
@@ -146,7 +146,7 @@ int stt_recorder_open(SttRecorder **out, int sample_rate, int max_seconds, int p
 
   pa_sample_spec ss = {
     .format = PA_SAMPLE_S16LE,
-    .rate = (uint32_t)sample_rate,
+    .rate = STT_SAMPLE_RATE,
     .channels = 1,
   };
   pa_buffer_attr attr = {
@@ -171,11 +171,11 @@ int stt_recorder_open(SttRecorder **out, int sample_rate, int max_seconds, int p
     return -1;
   }
   LOG_INFO("audio monitor ready: %d Hz mono, pre-roll %.2fs, post-roll %.2fs, max %.2fs, fragment %.3fs\n",
-          sample_rate,
-          rec->pre_roll_samples / (double)sample_rate,
-          rec->post_roll_samples / (double)sample_rate,
-          rec->max_samples / (double)sample_rate,
-          attr.fragsize / (double)(sample_rate * sizeof(int16_t)));
+          STT_SAMPLE_RATE,
+          rec->pre_roll_samples / (double)STT_SAMPLE_RATE,
+          rec->post_roll_samples / (double)STT_SAMPLE_RATE,
+          rec->max_samples / (double)STT_SAMPLE_RATE,
+          attr.fragsize / (double)(STT_SAMPLE_RATE * sizeof(int16_t)));
   *out = rec;
   return 0;
 }
