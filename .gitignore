@@ -5,3 +5,4 @@
 *.dll
 *.exe
 build/
+trace.txt

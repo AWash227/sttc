@@ -24,7 +24,7 @@ static void options_defaults(SttOptions *opts) {
   opts->type_delay_ms = 0;
   opts->max_audio_sec = 25;
   opts->pre_roll_ms = 350;
-  opts->post_roll_ms = 250;
+  opts->post_roll_ms = 0;
 }
 
 static int parse_int(const char *s, int *out) {

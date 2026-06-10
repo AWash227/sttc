@@ -16,6 +16,10 @@
 #define STT_EPSILON 1.0e-5f
 #define STT_PI 3.14159265358979323846
 
+static float g_window[STT_WIN_LENGTH];
+static float g_filters[STT_MEL_BINS * (STT_N_FFT / 2 + 1)];
+static int g_tables_ready;
+
 static double hz_to_mel(double f) {
   const double f_sp = 200.0 / 3.0;
   double m = f / f_sp;
@@ -65,37 +69,39 @@ static void build_mel_filters(float *filters) {
   }
 }
 
-static float sample_at(const float *x, size_t n, long idx) {
-  if (idx < 0 || (size_t)idx >= n) return 0.0f;
-  return x[idx];
+static float audio_sample_preemphasized(const SttAudioBuffer *audio, long idx) {
+  if (idx < 0 || (size_t)idx >= audio->len) return 0.0f;
+  float x = (float)audio->samples[idx] / 32768.0f;
+  if (idx == 0) return x;
+  float prev = (float)audio->samples[idx - 1] / 32768.0f;
+  return x - STT_PREEMPHASIS * prev;
+}
+
+static void ensure_tables(void) {
+  if (g_tables_ready) return;
+  build_hann(g_window);
+  build_mel_filters(g_filters);
+  g_tables_ready = 1;
 }
 
 int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
   memset(out, 0, sizeof(*out));
   if (!audio || !audio->samples || audio->len == 0 || audio->sample_rate != STT_SAMPLE_RATE) return -1;
 
-  float *wave = calloc(audio->len, sizeof(float));
-  float *window = calloc(STT_WIN_LENGTH, sizeof(float));
-  float *filters = calloc(STT_MEL_BINS * (STT_N_FFT / 2 + 1), sizeof(float));
   float *frame = fftwf_malloc(STT_N_FFT * sizeof(*frame));
   fftwf_complex *spectrum = fftwf_malloc((STT_N_FFT / 2 + 1) * sizeof(*spectrum));
   float *power = calloc(STT_N_FFT / 2 + 1, sizeof(float));
-  if (!wave || !window || !filters || !frame || !spectrum || !power) {
-    free(wave); free(window); free(filters); fftwf_free(frame); fftwf_free(spectrum); free(power);
+  if (!frame || !spectrum || !power) {
+    fftwf_free(frame); fftwf_free(spectrum); free(power);
     return -1;
   }
   fftwf_plan fft = fftwf_plan_dft_r2c_1d(STT_N_FFT, frame, spectrum, FFTW_ESTIMATE);
   if (!fft) {
-    free(wave); free(window); free(filters); fftwf_free(frame); fftwf_free(spectrum); free(power);
+    fftwf_free(frame); fftwf_free(spectrum); free(power);
     return -1;
   }
 
-  for (size_t i = 0; i < audio->len; ++i) {
-    float x = (float)audio->samples[i] / 32768.0f;
-    wave[i] = i == 0 ? x : x - STT_PREEMPHASIS * ((float)audio->samples[i - 1] / 32768.0f);
-  }
-  build_hann(window);
-  build_mel_filters(filters);
+  ensure_tables();
 
   size_t frames = audio->len / STT_HOP_LENGTH + 1;
   size_t valid_frames = audio->len / STT_HOP_LENGTH;
@@ -105,7 +111,7 @@ int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
   if (!out->data || !out->mask) {
     stt_features_free(out);
     fftwf_destroy_plan(fft);
-    free(wave); free(window); free(filters); fftwf_free(frame); fftwf_free(spectrum); free(power);
+    fftwf_free(frame); fftwf_free(spectrum); free(power);
     return -1;
   }
   out->frames = frames;
@@ -119,8 +125,8 @@ int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
     memset(frame, 0, STT_N_FFT * sizeof(*frame));
     for (int n = 0; n < STT_N_FFT; ++n) {
       int widx = n - win_pad;
-      float w = (widx >= 0 && widx < STT_WIN_LENGTH) ? window[widx] : 0.0f;
-      frame[n] = sample_at(wave, audio->len, frame_origin + n) * w;
+      float w = (widx >= 0 && widx < STT_WIN_LENGTH) ? g_window[widx] : 0.0f;
+      frame[n] = audio_sample_preemphasized(audio, frame_origin + n) * w;
     }
     fftwf_execute(fft);
     for (int k = 0; k <= STT_N_FFT / 2; ++k) {
@@ -131,7 +137,7 @@ int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
     for (int m = 0; m < STT_MEL_BINS; ++m) {
       double v = 0.0;
       for (int k = 0; k <= STT_N_FFT / 2; ++k) {
-        v += filters[m * (STT_N_FFT / 2 + 1) + k] * power[k];
+        v += g_filters[m * (STT_N_FFT / 2 + 1) + k] * power[k];
       }
       out->data[t * STT_MEL_BINS + m] = logf((float)v + STT_LOG_ZERO_GUARD);
     }
@@ -155,9 +161,6 @@ int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
   }
 
   fftwf_destroy_plan(fft);
-  free(wave);
-  free(window);
-  free(filters);
   fftwf_free(frame);
   fftwf_free(spectrum);
   free(power);
