@@ -5,21 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-  const char *name;
-  SttCommand command;
-} CommandDef;
-
-static const CommandDef COMMANDS[] = {
-  {"run", STT_CMD_RUN},
-  {"install-model", STT_CMD_INSTALL_MODEL},
-  {"inspect-model", STT_CMD_INSPECT_MODEL},
-  {"test-gpu", STT_CMD_TEST_GPU},
-};
-
 static void options_defaults(SttOptions *opts) {
   memset(opts, 0, sizeof(*opts));
-  opts->command = STT_CMD_NONE;
+  opts->model_dir = "~/.models/parakeet-tdt";
   opts->hotkey = "Super+V";
   opts->type_delay_ms = 0;
   opts->max_audio_sec = 25;
@@ -35,20 +23,10 @@ static int parse_int(const char *s, int *out) {
   return 0;
 }
 
-static SttCommand parse_command(const char *name) {
-  for (size_t i = 0; i < sizeof(COMMANDS) / sizeof(COMMANDS[0]); ++i) {
-    if (strcmp(name, COMMANDS[i].name) == 0) return COMMANDS[i].command;
-  }
-  return STT_CMD_NONE;
-}
-
 int stt_parse_args(int argc, char **argv, SttOptions *opts) {
   options_defaults(opts);
   if (argc < 2) return -1;
-
-  opts->command = parse_command(argv[1]);
-  if (opts->command == STT_CMD_NONE) return -1;
-  opts->model_dir = opts->command == STT_CMD_RUN ? "~/.models/parakeet-tdt" : "~/.models/parakeet-tdt-0.6b-v3";
+  if (strcmp(argv[1], "run") != 0) return -1;
 
   for (int i = 2; i < argc; ++i) {
     if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -77,9 +55,6 @@ int stt_parse_args(int argc, char **argv, SttOptions *opts) {
 void stt_print_usage(const char *argv0) {
   fprintf(stderr,
           "usage:\n"
-          "  %s install-model [--model-dir DIR]\n"
-          "  %s inspect-model [--model-dir DIR]\n"
-          "  %s test-gpu\n"
           "  %s run [--model-dir DIR] [--hotkey Super+V] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
-          argv0, argv0, argv0, argv0);
+          argv0);
 }

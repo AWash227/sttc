@@ -605,9 +605,9 @@ done:
   return rc;
 }
 
-static int tdt_runtime_prime(TdtRuntime *runtime) {
+static int tdt_runtime_prime_duration(TdtRuntime *runtime, int audio_sec) {
   const int sample_rate = 16000;
-  const size_t sample_count = (size_t)sample_rate * 2;
+  const size_t sample_count = (size_t)sample_rate * (size_t)audio_sec;
   int16_t *samples = calloc(sample_count, sizeof(*samples));
   if (!samples) return -1;
 
@@ -639,7 +639,8 @@ done:
   free(ids);
   if (encoded) runtime->ort.api->ReleaseValue(encoded);
   stt_features_free(&features);
-  LOG_INFO("infer: warmup_prime elapsed_ms=%lld features_ms=%lld encoder_ms=%lld decoder_ms=%lld decoder_calls=%lld output_ids=%zu rc=%d\n",
+  LOG_DEBUG("infer: warmup_prime audio_sec=%d elapsed_ms=%lld features_ms=%lld encoder_ms=%lld decoder_ms=%lld decoder_calls=%lld output_ids=%zu rc=%d\n",
+            audio_sec,
            stt_now_ms() - start_ms,
            rc == 0 ? feature_ms : 0,
            encoder_ms,
@@ -652,8 +653,16 @@ done_free_audio:
   return rc;
 }
 
+static int tdt_runtime_prime(TdtRuntime *runtime) {
+  static const int durations[] = {1, 2, 4, 8};
+  for (size_t i = 0; i < sizeof(durations) / sizeof(durations[0]); ++i) {
+    int rc = tdt_runtime_prime_duration(runtime, durations[i]);
+    if (rc != 0) return rc;
+  }
+  return 0;
+}
+
 int stt_transcribe_warmup(SttModel *model) {
-  if (stt_model_kind(model) != STT_MODEL_TDT_ONNX) return 0;
   long long start_ms = stt_now_ms();
   TdtRuntime *runtime = NULL;
   int rc = tdt_runtime_get(stt_model_dir(model), &runtime);
@@ -666,14 +675,7 @@ int stt_transcribe(SttModel *model, const SttAudioBuffer *audio, char **text_out
   static unsigned long long transcribe_seq = 0;
   unsigned long long transcribe_id = ++transcribe_seq;
   double seconds = audio->sample_rate ? (double)audio->len / (double)audio->sample_rate : 0.0;
-  LOG_TRACE("infer: start id=%llu audio_sec=%.2f samples=%zu sample_rate=%d channels=%d model_kind=%d\n",
-            transcribe_id, seconds, audio->len, audio->sample_rate, audio->channels, stt_model_kind(model));
-
-  if (stt_model_kind(model) == STT_MODEL_TDT_ONNX) {
-    return transcribe_tdt_onnx(model, audio, text_out);
-  }
-
-  LOG_ERROR("this model layout is only inspectable in this build; use the TDT ONNX model directory for transcription\n");
-  *text_out = strdup("");
-  return -2;
+  LOG_TRACE("infer: start id=%llu audio_sec=%.2f samples=%zu sample_rate=%d channels=%d\n",
+            transcribe_id, seconds, audio->len, audio->sample_rate, audio->channels);
+  return transcribe_tdt_onnx(model, audio, text_out);
 }

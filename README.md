@@ -6,18 +6,13 @@ Small C dictation CLI targeting NVIDIA Parakeet TDT ONNX models on Linux.
 
 Implemented:
 
-- CLI commands: `install-model`, `inspect-model`, `test-gpu`, `run`
+- CLI command: `run`
 - TDT ONNX model directory contract under `~/.models/parakeet-tdt`
-- v3 safetensors inspection under `~/.models/parakeet-tdt-0.6b-v3`
-- Hugging Face file download with libcurl
-- safetensors header parsing without the safetensors library
-- tokenizer loading and basic Metaspace decode without the tokenizers library
-- CUDA driver initialization and upload of v3 F32/BF16/F16 tensors into VRAM
 - ONNX Runtime execution of TDT encoder and decoder/joint graphs
 - PulseAudio default microphone capture while `Super+V` is held
 - Linux input-device hotkey grabbing for `Super+V`
 - XTest ASCII typing with configurable per-character delay
-- TDT greedy decoder helper for logits shaped as token logits plus duration logits
+- TDT greedy decoding for logits shaped as token logits plus duration logits
 
 Not complete yet:
 
@@ -34,9 +29,6 @@ cmake --build build
 ## Usage
 
 ```sh
-./build/stt install-model
-./build/stt inspect-model
-./build/stt test-gpu
 ./build/stt run --dry-run
 ```
 

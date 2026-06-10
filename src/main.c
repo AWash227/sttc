@@ -1,18 +1,18 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt/audio.h"
 #include "stt/cli.h"
-#include "stt/cuda_runtime.h"
 #include "stt/hotkey.h"
 #include "stt/infer.h"
 #include "stt/log.h"
 #include "stt/model.h"
-#include "stt/model_install.h"
 #include "stt/text_x11.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 typedef struct TranscribeJob {
@@ -40,7 +40,6 @@ typedef struct {
 
 typedef struct {
   const SttOptions *opts;
-  SttModel *model;
   SttRecorder *recorder;
   TranscribeQueue *queue;
   int recording;
@@ -54,6 +53,14 @@ static size_t transcribe_queue_depth(TranscribeQueue *queue) {
   size_t depth = queue->depth;
   pthread_mutex_unlock(&queue->mutex);
   return depth;
+}
+
+static void type_phrase(const char *text, int delay_ms) {
+  stt_type_text_x11(text, delay_ms);
+  size_t len = strlen(text);
+  if (len > 0 && !isspace((unsigned char)text[len - 1])) {
+    stt_type_text_x11(" ", delay_ms);
+  }
 }
 
 static void *transcribe_worker(void *arg) {
@@ -98,7 +105,7 @@ static void *transcribe_worker(void *arg) {
           LOG_DEBUG("run: capture=%llu type_wait elapsed_ms=%lld reason=recording_active\n", job->capture_id, type_wait_ms);
         }
         long long type_start_ms = stt_now_ms();
-        stt_type_text_x11(text, queue->opts->type_delay_ms);
+        type_phrase(text, queue->opts->type_delay_ms);
         type_ms = stt_now_ms() - type_start_ms;
         LOG_DEBUG("run: capture=%llu type elapsed_ms=%lld\n", job->capture_id, type_ms);
       }
@@ -255,18 +262,6 @@ static void on_hotkey(int pressed, void *user) {
            capture_id, stt_now_ms() - capture_start_ms, commit_ms, depth);
 }
 
-static int cmd_test_gpu(void) {
-  SttCuda cuda;
-  if (stt_cuda_init(&cuda) != 0) {
-    LOG_ERROR("CUDA test failed: %s\n", stt_cuda_last_error());
-    return 1;
-  }
-  printf("CUDA device: %s\n", cuda.name);
-  printf("VRAM: %.2f GiB\n", (double)cuda.total_mem / (1024.0 * 1024.0 * 1024.0));
-  stt_cuda_destroy(&cuda);
-  return 0;
-}
-
 int main(int argc, char **argv) {
   SttOptions opts;
   if (stt_parse_args(argc, argv, &opts) != 0) {
@@ -274,44 +269,31 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  switch (opts.command) {
-    case STT_CMD_INSTALL_MODEL:
-      return stt_install_model_v3(opts.model_dir) == 0 ? 0 : 1;
-    case STT_CMD_INSPECT_MODEL:
-      return stt_model_inspect(opts.model_dir) == 0 ? 0 : 1;
-    case STT_CMD_TEST_GPU:
-      return cmd_test_gpu();
-    case STT_CMD_RUN: {
-      SttModel *model = NULL;
-      if (stt_model_load(&model, opts.model_dir) != 0) return 1;
-      SttRecorder *recorder = NULL;
-      if (stt_recorder_open(&recorder, 16000, opts.max_audio_sec, opts.pre_roll_ms, opts.post_roll_ms) != 0) {
-        stt_model_free(model);
-        return 1;
-      }
-      long long warmup_start_ms = stt_now_ms();
-      int warmup_rc = stt_transcribe_warmup(model);
-      LOG_INFO("run: warmup rc=%d elapsed_ms=%lld\n", warmup_rc, stt_now_ms() - warmup_start_ms);
-      if (warmup_rc != 0) {
-        stt_recorder_close(recorder);
-        stt_model_free(model);
-        return 1;
-      }
-      TranscribeQueue queue;
-      if (transcribe_queue_start(&queue, &opts, model) != 0) {
-        stt_recorder_close(recorder);
-        stt_model_free(model);
-        return 1;
-      }
-      RunState state = {.opts = &opts, .model = model, .recorder = recorder, .queue = &queue};
-      int rc = stt_hotkey_loop(opts.hotkey, on_hotkey, &state);
-      transcribe_queue_stop(&queue);
-      stt_recorder_close(recorder);
-      stt_model_free(model);
-      return rc == 0 ? 0 : 1;
-    }
-    default:
-      stt_print_usage(argv[0]);
-      return 2;
+  SttModel *model = NULL;
+  if (stt_model_load(&model, opts.model_dir) != 0) return 1;
+  SttRecorder *recorder = NULL;
+  if (stt_recorder_open(&recorder, 16000, opts.max_audio_sec, opts.pre_roll_ms, opts.post_roll_ms) != 0) {
+    stt_model_free(model);
+    return 1;
   }
+  long long warmup_start_ms = stt_now_ms();
+  int warmup_rc = stt_transcribe_warmup(model);
+  LOG_INFO("run: warmup rc=%d elapsed_ms=%lld\n", warmup_rc, stt_now_ms() - warmup_start_ms);
+  if (warmup_rc != 0) {
+    stt_recorder_close(recorder);
+    stt_model_free(model);
+    return 1;
+  }
+  TranscribeQueue queue;
+  if (transcribe_queue_start(&queue, &opts, model) != 0) {
+    stt_recorder_close(recorder);
+    stt_model_free(model);
+    return 1;
+  }
+  RunState state = {.opts = &opts, .recorder = recorder, .queue = &queue};
+  int rc = stt_hotkey_loop(opts.hotkey, on_hotkey, &state);
+  transcribe_queue_stop(&queue);
+  stt_recorder_close(recorder);
+  stt_model_free(model);
+  return rc == 0 ? 0 : 1;
 }

@@ -10,14 +10,9 @@ pkg_check_modules(STT_DEPS REQUIRED
   libpulse-simple
   x11
   xtst
-  json-c
-  libcurl
   libonnxruntime
   fftw3f
-  samplerate
   cuda
-  cublas
-  cufft
 )
 
 file(GLOB STT_SOURCES CONFIGURE_DEPENDS src/*.c)

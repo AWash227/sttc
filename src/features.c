@@ -18,6 +18,8 @@
 
 static float g_window[STT_WIN_LENGTH];
 static float g_filters[STT_MEL_BINS * (STT_N_FFT / 2 + 1)];
+static int g_filter_start[STT_MEL_BINS];
+static int g_filter_end[STT_MEL_BINS];
 static float *g_frame;
 static fftwf_complex *g_spectrum;
 static float *g_power;
@@ -45,7 +47,7 @@ static void build_hann(float *window) {
   }
 }
 
-static void build_mel_filters(float *filters) {
+static void build_mel_filters(float *filters, int *starts, int *ends) {
   memset(filters, 0, STT_MEL_BINS * (STT_N_FFT / 2 + 1) * sizeof(float));
   double mel_min = hz_to_mel(0.0);
   double mel_max = hz_to_mel(STT_SAMPLE_RATE / 2.0);
@@ -60,6 +62,8 @@ static void build_mel_filters(float *filters) {
     double center = hz_points[m + 1];
     double upper = hz_points[m + 2];
     double enorm = 2.0 / (upper - lower);
+    starts[m] = STT_N_FFT / 2 + 1;
+    ends[m] = 0;
     for (int k = 0; k <= STT_N_FFT / 2; ++k) {
       double hz = (double)k * STT_SAMPLE_RATE / STT_N_FFT;
       double w = 0.0;
@@ -68,8 +72,14 @@ static void build_mel_filters(float *filters) {
       } else if (hz > center && hz <= upper && upper > center) {
         w = (upper - hz) / (upper - center);
       }
-      filters[m * (STT_N_FFT / 2 + 1) + k] = (float)(w * enorm);
+      float weight = (float)(w * enorm);
+      filters[m * (STT_N_FFT / 2 + 1) + k] = weight;
+      if (weight > 0.0f) {
+        if (k < starts[m]) starts[m] = k;
+        if (k + 1 > ends[m]) ends[m] = k + 1;
+      }
     }
+    if (starts[m] > ends[m]) starts[m] = ends[m] = 0;
   }
 }
 
@@ -84,7 +94,7 @@ static float audio_sample_preemphasized(const SttAudioBuffer *audio, long idx) {
 static void ensure_tables(void) {
   if (g_tables_ready) return;
   build_hann(g_window);
-  build_mel_filters(g_filters);
+  build_mel_filters(g_filters, g_filter_start, g_filter_end);
   g_tables_ready = 1;
 }
 
@@ -143,7 +153,7 @@ int stt_extract_features(const SttAudioBuffer *audio, SttFeatures *out) {
     }
     for (int m = 0; m < STT_MEL_BINS; ++m) {
       double v = 0.0;
-      for (int k = 0; k <= STT_N_FFT / 2; ++k) {
+      for (int k = g_filter_start[m]; k < g_filter_end[m]; ++k) {
         v += g_filters[m * (STT_N_FFT / 2 + 1) + k] * g_power[k];
       }
       out->data[m * frames + t] = logf((float)v + STT_LOG_ZERO_GUARD);
