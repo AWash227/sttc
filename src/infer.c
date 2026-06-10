@@ -2,14 +2,15 @@
 #include "stt/infer.h"
 #include "stt/features.h"
 #include "stt/fs.h"
+#include "stt/log.h"
 
 #include <cuda.h>
 #include <onnxruntime_c_api.h>
+#include <errno.h>
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define TDT_FEATURE_BINS 128
 #define TDT_ENCODER_DIM 1024
@@ -52,12 +53,6 @@ typedef struct {
 
 static TdtRuntime g_tdt_runtime;
 
-static long long now_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static double elapsed_rtf(long long elapsed_ms, double audio_sec) {
   return audio_sec > 0.0 ? (double)elapsed_ms / (audio_sec * 1000.0) : 0.0;
 }
@@ -66,7 +61,7 @@ static const char *requested_tdt_variant(void) {
   const char *variant = getenv("STT_TDT_VARIANT");
   if (!variant || !*variant || strcmp(variant, "auto") == 0) return "fp32";
   if (strcmp(variant, "fp32") == 0 || strcmp(variant, "int8") == 0) return variant;
-  fprintf(stderr, "infer: unknown STT_TDT_VARIANT=%s using=fp32\n", variant);
+  LOG_WARN("infer: unknown STT_TDT_VARIANT=%s using=fp32\n", variant);
   return "fp32";
 }
 
@@ -89,7 +84,7 @@ static void tdt_variant_files(const char *model_dir, const char **variant_out, c
       encoder_file = "encoder-model.int8.onnx";
       decoder_file = "decoder_joint-model.int8.onnx";
     } else {
-      fprintf(stderr, "infer: tdt_variant=int8 unavailable; falling back to fp32\n");
+      LOG_WARN("infer: tdt_variant=int8 unavailable; falling back to fp32\n");
       variant = "fp32";
     }
   }
@@ -113,7 +108,7 @@ static OrtCudnnConvAlgoSearch cudnn_algo_search_from_env(const char **name_out) 
     *name_out = "EXHAUSTIVE";
     return OrtCudnnConvAlgoSearchExhaustive;
   }
-  fprintf(stderr, "infer: unknown STT_CUDNN_CONV_ALGO_SEARCH=%s using=DEFAULT\n", value);
+  LOG_WARN("infer: unknown STT_CUDNN_CONV_ALGO_SEARCH=%s using=DEFAULT\n", value);
   *name_out = "DEFAULT";
   return OrtCudnnConvAlgoSearchDefault;
 }
@@ -147,7 +142,7 @@ static int argmax(const float *xs, size_t n) {
 
 static int ort_check(OrtTdt *ort, OrtStatus *status, const char *what) {
   if (!status) return 0;
-  fprintf(stderr, "%s: %s\n", what, ort->api->GetErrorMessage(status));
+  LOG_ERROR("%s: %s\n", what, ort->api->GetErrorMessage(status));
   ort->api->ReleaseStatus(status);
   return -1;
 }
@@ -171,7 +166,7 @@ static int tdt_vocab_load(TdtVocab *vocab, const char *path) {
   size_t len = 0;
   char *text = stt_read_file(path, &len);
   if (!text) {
-    perror(path);
+    LOG_ERROR("failed to read vocab: %s: %s\n", path, strerror(errno));
     return -1;
   }
 
@@ -263,13 +258,13 @@ static void tdt_runtime_free(TdtRuntime *runtime) {
 }
 
 static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant, const char *encoder_file, const char *decoder_file) {
-  long long start_ms = now_ms();
+  long long start_ms = stt_now_ms();
   memset(ort, 0, sizeof(*ort));
   ort->api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
   char *encoder_path = stt_path_join(model_dir, encoder_file);
   char *decoder_path = stt_path_join(model_dir, decoder_file);
   if (!encoder_path || !decoder_path) goto fail;
-  fprintf(stderr, "infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
+  LOG_INFO("infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
 
   if (ort_check(ort, ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "stt", &ort->env), "CreateEnv") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSessionOptions(&ort->options), "CreateSessionOptions") != 0) goto fail;
@@ -278,7 +273,7 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
 
   int cuda_ep = 0;
   if (!cuda_device_available()) {
-    fprintf(stderr, "infer: ort_init cuda_ep_configured=0 reason=\"no CUDA device available\"\n");
+    LOG_INFO("infer: ort_init cuda_ep_configured=0 reason=\"no CUDA device available\"\n");
   } else {
     const char *algo_name = NULL;
     OrtCudnnConvAlgoSearch algo_search = cudnn_algo_search_from_env(&algo_name);
@@ -291,17 +286,17 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
     };
     OrtStatus *cuda_status = ort->api->SessionOptionsAppendExecutionProvider_CUDA(ort->options, &cuda_options);
     if (cuda_status) {
-      fprintf(stderr, "infer: ort_init cuda_ep_configured=0 reason=\"%s\"\n", ort->api->GetErrorMessage(cuda_status));
+      LOG_WARN("infer: ort_init cuda_ep_configured=0 reason=\"%s\"\n", ort->api->GetErrorMessage(cuda_status));
       ort->api->ReleaseStatus(cuda_status);
     } else {
       cuda_ep = 1;
-      fprintf(stderr, "infer: ort_init cuda_ep_configured=1 cudnn_conv_algo_search=%s\n", algo_name);
+      LOG_INFO("infer: ort_init cuda_ep_configured=1 cudnn_conv_algo_search=%s\n", algo_name);
     }
   }
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->memory), "CreateCpuMemoryInfo") != 0) goto fail;
-  fprintf(stderr, "infer: ort_init done elapsed_ms=%lld cuda_ep=%d\n", now_ms() - start_ms, cuda_ep);
+  LOG_INFO("infer: ort_init done elapsed_ms=%lld cuda_ep=%d\n", stt_now_ms() - start_ms, cuda_ep);
 
   free(encoder_path);
   free(decoder_path);
@@ -315,7 +310,7 @@ fail:
 }
 
 static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
-  long long start_ms = now_ms();
+  long long start_ms = stt_now_ms();
   const char *variant = NULL;
   const char *encoder_file = NULL;
   const char *decoder_file = NULL;
@@ -324,12 +319,12 @@ static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
   if (g_tdt_runtime.ready &&
       strcmp(g_tdt_runtime.model_dir, model_dir) == 0 &&
       strcmp(g_tdt_runtime.variant, variant) == 0) {
-    fprintf(stderr, "infer: runtime_cache hit=1 elapsed_ms=0\n");
+    LOG_TRACE("infer: runtime_cache hit=1 elapsed_ms=0\n");
     *runtime_out = &g_tdt_runtime;
     return 0;
   }
 
-  fprintf(stderr, "infer: runtime_cache hit=0 loading model_dir=%s variant=%s\n", model_dir, variant);
+  LOG_INFO("infer: runtime_cache hit=0 loading model_dir=%s variant=%s\n", model_dir, variant);
   tdt_runtime_free(&g_tdt_runtime);
   char *vocab_path = stt_path_join(model_dir, "vocab.txt");
   if (!vocab_path) return -1;
@@ -351,8 +346,8 @@ static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
     return -1;
   }
   g_tdt_runtime.ready = 1;
-  fprintf(stderr, "infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s\n",
-          now_ms() - start_ms, g_tdt_runtime.vocab.count, g_tdt_runtime.variant);
+  LOG_INFO("infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s\n",
+           stt_now_ms() - start_ms, g_tdt_runtime.vocab.count, g_tdt_runtime.variant);
   *runtime_out = &g_tdt_runtime;
   return 0;
 }
@@ -372,7 +367,7 @@ static int get_tensor_i64(OrtTdt *ort, OrtValue *value, int64_t **data_out) {
 }
 
 static int encoder_run(OrtTdt *ort, const SttFeatures *features, OrtValue **encoded_out, int64_t *encoded_len_out, long long *elapsed_ms_out) {
-  long long start_ms = now_ms();
+  long long start_ms = stt_now_ms();
   float *input = calloc(features->valid_frames * TDT_FEATURE_BINS, sizeof(*input));
   if (!input) return -1;
   for (size_t t = 0; t < features->valid_frames; ++t) {
@@ -407,7 +402,7 @@ done:
   if (inputs[0]) ort->api->ReleaseValue(inputs[0]);
   if (inputs[1]) ort->api->ReleaseValue(inputs[1]);
   free(input);
-  if (elapsed_ms_out) *elapsed_ms_out = now_ms() - start_ms;
+  if (elapsed_ms_out) *elapsed_ms_out = stt_now_ms() - start_ms;
   return rc;
 }
 
@@ -491,9 +486,9 @@ static int tdt_greedy_decode_onnx(OrtTdt *ort, OrtValue *encoded_value, int64_t 
 
   for (int64_t t = 0; t < encoded_len;) {
     float logits[TDT_VOCAB_SIZE + TDT_DURATION_COUNT];
-    long long step_start_ms = now_ms();
+    long long step_start_ms = stt_now_ms();
     if (decoder_step(ort, encoder, encoded_len, t, target, state1, state2, next_state1, next_state2, logits) != 0) goto fail;
-    stats->decoder_ms += now_ms() - step_start_ms;
+    stats->decoder_ms += stt_now_ms() - step_start_ms;
     stats->decoder_calls++;
 
     int token = argmax(logits, TDT_VOCAB_SIZE);
@@ -531,41 +526,46 @@ fail:
 
 static int transcribe_tdt_onnx(SttModel *model, const SttAudioBuffer *audio, char **text_out) {
   SttFeatures features;
-  long long total_start_ms = now_ms();
+  long long total_start_ms = stt_now_ms();
   double audio_sec = audio->sample_rate ? (double)audio->len / (double)audio->sample_rate : 0.0;
-  long long feature_start_ms = now_ms();
+  long long feature_start_ms = stt_now_ms();
   if (stt_extract_features(audio, &features) != 0) {
-    fprintf(stderr, "feature extraction failed\n");
+    LOG_ERROR("feature extraction failed\n");
     *text_out = strdup("");
     return -1;
   }
-  fprintf(stderr, "infer: features elapsed_ms=%lld frames=%zu valid=%zu bins=%zu\n",
-          now_ms() - feature_start_ms, features.frames, features.valid_frames, features.bins);
+  long long feature_ms = stt_now_ms() - feature_start_ms;
+  LOG_TRACE("infer: features elapsed_ms=%lld frames=%zu valid=%zu bins=%zu\n",
+            feature_ms, features.frames, features.valid_frames, features.bins);
 
   TdtRuntime *runtime = NULL;
   OrtValue *encoded = NULL;
   int *ids = NULL;
   size_t id_count = 0;
   int64_t encoded_len = 0;
+  long long runtime_ms = 0;
   long long encoder_ms = 0;
-  DecodeStats decode_stats;
+  long long text_ms = 0;
+  DecodeStats decode_stats = {0};
   int rc = -1;
 
+  long long runtime_start_ms = stt_now_ms();
   if (tdt_runtime_get(stt_model_dir(model), &runtime) != 0) goto done;
+  runtime_ms = stt_now_ms() - runtime_start_ms;
   if (encoder_run(&runtime->ort, &features, &encoded, &encoded_len, &encoder_ms) != 0) goto done;
-  fprintf(stderr, "infer: encoder elapsed_ms=%lld encoded_frames=%lld\n", encoder_ms, (long long)encoded_len);
+  LOG_TRACE("infer: encoder elapsed_ms=%lld encoded_frames=%lld\n", encoder_ms, (long long)encoded_len);
   if (tdt_greedy_decode_onnx(&runtime->ort, encoded, encoded_len, &ids, &id_count, &decode_stats) != 0) goto done;
-  fprintf(stderr,
-          "infer: decoder elapsed_ms=%lld calls=%lld blank_steps=%lld emitted_tokens=%lld advanced_frames=%lld output_ids=%zu\n",
-          decode_stats.decoder_ms,
-          (long long)decode_stats.decoder_calls,
-          (long long)decode_stats.blank_steps,
-          (long long)decode_stats.emitted_tokens,
-          (long long)decode_stats.advanced_frames,
-          id_count);
-  long long text_start_ms = now_ms();
+  LOG_TRACE("infer: decoder elapsed_ms=%lld calls=%lld blank_steps=%lld emitted_tokens=%lld advanced_frames=%lld output_ids=%zu\n",
+            decode_stats.decoder_ms,
+            (long long)decode_stats.decoder_calls,
+            (long long)decode_stats.blank_steps,
+            (long long)decode_stats.emitted_tokens,
+            (long long)decode_stats.advanced_frames,
+            id_count);
+  long long text_start_ms = stt_now_ms();
   if (tdt_vocab_decode(&runtime->vocab, ids, id_count, text_out) != 0) goto done;
-  fprintf(stderr, "infer: text_decode elapsed_ms=%lld chars=%zu\n", now_ms() - text_start_ms, *text_out ? strlen(*text_out) : 0);
+  text_ms = stt_now_ms() - text_start_ms;
+  LOG_TRACE("infer: text_decode elapsed_ms=%lld chars=%zu\n", text_ms, *text_out ? strlen(*text_out) : 0);
   rc = 0;
 
 done:
@@ -573,17 +573,97 @@ done:
   free(ids);
   if (encoded && runtime) runtime->ort.api->ReleaseValue(encoded);
   stt_features_free(&features);
-  long long total_ms = now_ms() - total_start_ms;
-  fprintf(stderr, "infer: total elapsed_ms=%lld rtf=%.3f rc=%d\n", total_ms, elapsed_rtf(total_ms, audio_sec), rc);
+  long long total_ms = stt_now_ms() - total_start_ms;
+  const char *longest = "features";
+  long long longest_ms = feature_ms;
+  if (runtime_ms > longest_ms) {
+    longest = "runtime";
+    longest_ms = runtime_ms;
+  }
+  if (encoder_ms > longest_ms) {
+    longest = "encoder";
+    longest_ms = encoder_ms;
+  }
+  if (decode_stats.decoder_ms > longest_ms) {
+    longest = "decoder";
+    longest_ms = decode_stats.decoder_ms;
+  }
+  if (text_ms > longest_ms) {
+    longest = "text_decode";
+    longest_ms = text_ms;
+  }
+  long long measured_ms = feature_ms + runtime_ms + encoder_ms + decode_stats.decoder_ms + text_ms;
+  long long overhead_ms = total_ms > measured_ms ? total_ms - measured_ms : 0;
+  LOG_INFO("perf: infer total_ms=%lld rtf=%.3f longest=%s longest_ms=%lld features_ms=%lld runtime_ms=%lld encoder_ms=%lld decoder_ms=%lld text_ms=%lld overhead_ms=%lld rc=%d\n",
+           total_ms,
+           elapsed_rtf(total_ms, audio_sec),
+           longest,
+           longest_ms,
+           feature_ms,
+           runtime_ms,
+           encoder_ms,
+           decode_stats.decoder_ms,
+           text_ms,
+           overhead_ms,
+           rc);
+  LOG_TRACE("infer: total elapsed_ms=%lld rtf=%.3f rc=%d\n", total_ms, elapsed_rtf(total_ms, audio_sec), rc);
+  return rc;
+}
+
+static int tdt_runtime_prime(TdtRuntime *runtime) {
+  const int sample_rate = 16000;
+  const size_t sample_count = (size_t)sample_rate * 2;
+  int16_t *samples = calloc(sample_count, sizeof(*samples));
+  if (!samples) return -1;
+
+  SttAudioBuffer audio = {
+    .samples = samples,
+    .len = sample_count,
+    .cap = sample_count,
+    .sample_rate = sample_rate,
+    .channels = 1,
+  };
+  SttFeatures features;
+  OrtValue *encoded = NULL;
+  int *ids = NULL;
+  size_t id_count = 0;
+  int64_t encoded_len = 0;
+  long long encoder_ms = 0;
+  DecodeStats decode_stats = {0};
+  int rc = -1;
+
+  long long start_ms = stt_now_ms();
+  long long feature_start_ms = stt_now_ms();
+  if (stt_extract_features(&audio, &features) != 0) goto done_free_audio;
+  long long feature_ms = stt_now_ms() - feature_start_ms;
+  if (encoder_run(&runtime->ort, &features, &encoded, &encoded_len, &encoder_ms) != 0) goto done;
+  if (tdt_greedy_decode_onnx(&runtime->ort, encoded, encoded_len, &ids, &id_count, &decode_stats) != 0) goto done;
+  rc = 0;
+
+done:
+  free(ids);
+  if (encoded) runtime->ort.api->ReleaseValue(encoded);
+  stt_features_free(&features);
+  LOG_INFO("infer: warmup_prime elapsed_ms=%lld features_ms=%lld encoder_ms=%lld decoder_ms=%lld decoder_calls=%lld output_ids=%zu rc=%d\n",
+           stt_now_ms() - start_ms,
+           rc == 0 ? feature_ms : 0,
+           encoder_ms,
+           decode_stats.decoder_ms,
+           (long long)decode_stats.decoder_calls,
+           id_count,
+           rc);
+done_free_audio:
+  free(samples);
   return rc;
 }
 
 int stt_transcribe_warmup(SttModel *model) {
   if (stt_model_kind(model) != STT_MODEL_TDT_ONNX) return 0;
-  long long start_ms = now_ms();
+  long long start_ms = stt_now_ms();
   TdtRuntime *runtime = NULL;
   int rc = tdt_runtime_get(stt_model_dir(model), &runtime);
-  fprintf(stderr, "infer: warmup elapsed_ms=%lld rc=%d\n", now_ms() - start_ms, rc);
+  if (rc == 0) rc = tdt_runtime_prime(runtime);
+  LOG_INFO("infer: warmup elapsed_ms=%lld rc=%d\n", stt_now_ms() - start_ms, rc);
   return rc;
 }
 
@@ -591,14 +671,14 @@ int stt_transcribe(SttModel *model, const SttAudioBuffer *audio, char **text_out
   static unsigned long long transcribe_seq = 0;
   unsigned long long transcribe_id = ++transcribe_seq;
   double seconds = audio->sample_rate ? (double)audio->len / (double)audio->sample_rate : 0.0;
-  fprintf(stderr, "infer: start id=%llu audio_sec=%.2f samples=%zu sample_rate=%d channels=%d model_kind=%d\n",
-          transcribe_id, seconds, audio->len, audio->sample_rate, audio->channels, stt_model_kind(model));
+  LOG_TRACE("infer: start id=%llu audio_sec=%.2f samples=%zu sample_rate=%d channels=%d model_kind=%d\n",
+            transcribe_id, seconds, audio->len, audio->sample_rate, audio->channels, stt_model_kind(model));
 
   if (stt_model_kind(model) == STT_MODEL_TDT_ONNX) {
     return transcribe_tdt_onnx(model, audio, text_out);
   }
 
-  fprintf(stderr, "this model layout is only inspectable in this build; use the TDT ONNX model directory for transcription\n");
+  LOG_ERROR("this model layout is only inspectable in this build; use the TDT ONNX model directory for transcription\n");
   *text_out = strdup("");
   return -2;
 }

@@ -2,6 +2,7 @@
 #include "stt/model.h"
 #include "stt/cuda_runtime.h"
 #include "stt/fs.h"
+#include "stt/log.h"
 #include "stt/safetensors.h"
 #include "stt/tokenizer.h"
 
@@ -56,7 +57,7 @@ static int files_exist(const char *model_dir, const char *const *files, size_t c
   for (size_t i = 0; i < count; ++i) {
     char *path = stt_path_join(model_dir, files[i]);
     if (!path || !stt_file_exists(path)) {
-      if (print_missing) fprintf(stderr, "missing model file: %s/%s\n", model_dir, files[i]);
+      if (print_missing) LOG_ERROR("missing model file: %s/%s\n", model_dir, files[i]);
       ok = -1;
     }
     free(path);
@@ -67,13 +68,13 @@ static int files_exist(const char *model_dir, const char *const *files, size_t c
 static int validate_v3_tensors(const SttSafeTensors *st) {
   for (size_t i = 0; i < sizeof(REQUIRED_TENSORS) / sizeof(REQUIRED_TENSORS[0]); ++i) {
     if (!stt_safetensors_find(st, REQUIRED_TENSORS[i])) {
-      fprintf(stderr, "missing expected v3 tensor: %s\n", REQUIRED_TENSORS[i]);
+      LOG_ERROR("missing expected v3 tensor: %s\n", REQUIRED_TENSORS[i]);
       return -1;
     }
   }
   const SttTensorInfo *joint = stt_safetensors_find(st, "joint.head.weight");
   if (!joint || joint->rank != 2 || joint->shape[0] != 8198 || joint->shape[1] != 640) {
-    fprintf(stderr, "unexpected joint.head.weight shape; this does not look like Parakeet-TDT v3\n");
+    LOG_ERROR("unexpected joint.head.weight shape; this does not look like Parakeet-TDT v3\n");
     return -1;
   }
   return 0;
@@ -134,7 +135,7 @@ int stt_model_load(SttModel **model_out, const char *model_dir_arg) {
   if (files_exist(model->model_dir, TDT_ONNX_FILES, sizeof(TDT_ONNX_FILES) / sizeof(TDT_ONNX_FILES[0]), 0) == 0) {
     model->kind = STT_MODEL_TDT_ONNX;
     model->loaded = 1;
-    fprintf(stderr, "loaded TDT ONNX model: %s\n", model->model_dir);
+    LOG_INFO("loaded TDT ONNX model: %s\n", model->model_dir);
     *model_out = model;
     return 0;
   }
@@ -148,11 +149,11 @@ int stt_model_load(SttModel **model_out, const char *model_dir_arg) {
   if (stt_safetensors_open(&model->tensors, weights) != 0) goto fail;
   if (validate_v3_tensors(&model->tensors) != 0) goto fail;
   if (stt_tokenizer_load(&model->tokenizer, tokenizer) != 0) {
-    fprintf(stderr, "failed to load tokenizer: %s\n", tokenizer);
+    LOG_ERROR("failed to load tokenizer: %s\n", tokenizer);
     goto fail;
   }
   if (stt_cuda_init(&model->cuda) != 0) {
-    fprintf(stderr, "CUDA unavailable: %s\n", stt_cuda_last_error());
+    LOG_ERROR("CUDA unavailable: %s\n", stt_cuda_last_error());
     goto fail;
   }
 
@@ -164,12 +165,12 @@ int stt_model_load(SttModel **model_out, const char *model_dir_arg) {
     void *host = NULL;
     size_t bytes = 0;
     if (stt_safetensors_read_tensor(&model->tensors, info, &host, &bytes) != 0) {
-      fprintf(stderr, "failed reading tensor: %s\n", info->name);
+      LOG_ERROR("failed reading tensor: %s\n", info->name);
       goto fail;
     }
     CUdeviceptr ptr = 0;
     if (stt_cuda_upload(host, bytes, &ptr) != 0) {
-      fprintf(stderr, "failed uploading tensor %s: %s\n", info->name, stt_cuda_last_error());
+      LOG_ERROR("failed uploading tensor %s: %s\n", info->name, stt_cuda_last_error());
       free(host);
       goto fail;
     }
@@ -184,7 +185,7 @@ int stt_model_load(SttModel **model_out, const char *model_dir_arg) {
     model->gpu_tensor_count++;
   }
   model->loaded = 1;
-  fprintf(stderr, "loaded %zu tensors to %s VRAM\n", model->gpu_tensor_count, model->cuda.name);
+  LOG_INFO("loaded %zu tensors to %s VRAM\n", model->gpu_tensor_count, model->cuda.name);
   free(weights);
   free(tokenizer);
   *model_out = model;

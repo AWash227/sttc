@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt/hotkey.h"
+#include "stt/log.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -63,14 +64,14 @@ static int forward_event(int fd, const struct input_event *ev) {
 static int open_virtual_keyboard(void) {
   int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
-    fprintf(stderr, "hotkey: open /dev/uinput failed: %s\n", strerror(errno));
+    LOG_ERROR("hotkey: open /dev/uinput failed: %s\n", strerror(errno));
     return -1;
   }
 
   if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
       ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0 ||
       ioctl(fd, UI_SET_EVBIT, EV_REP) < 0) {
-    fprintf(stderr, "hotkey: configure /dev/uinput failed: %s\n", strerror(errno));
+    LOG_ERROR("hotkey: configure /dev/uinput failed: %s\n", strerror(errno));
     close(fd);
     return -1;
   }
@@ -88,7 +89,7 @@ static int open_virtual_keyboard(void) {
   setup.id.version = 1;
 
   if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
-    fprintf(stderr, "hotkey: create virtual keyboard failed: %s\n", strerror(errno));
+    LOG_ERROR("hotkey: create virtual keyboard failed: %s\n", strerror(errno));
     close(fd);
     return -1;
   }
@@ -128,7 +129,7 @@ static int discover_keyboards(Keyboards *keyboards) {
   memset(&matches, 0, sizeof(matches));
   if (glob("/dev/input/by-id/*-event-kbd", 0, NULL, &matches) != 0 || matches.gl_pathc == 0) {
     globfree(&matches);
-    fprintf(stderr, "hotkey: no keyboard devices found; set STT_KEYBOARD_DEVICE=/dev/input/...\n");
+    LOG_ERROR("hotkey: no keyboard devices found; set STT_KEYBOARD_DEVICE=/dev/input/...\n");
     return -1;
   }
 
@@ -149,11 +150,11 @@ static int grab_keyboards(Keyboards *keyboards) {
     Keyboard *keyboard = &keyboards->items[i];
     keyboard->fd = open(keyboard->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (keyboard->fd < 0) {
-      fprintf(stderr, "hotkey: open %s failed: %s\n", keyboard->path, strerror(errno));
+      LOG_WARN("hotkey: open %s failed: %s\n", keyboard->path, strerror(errno));
       continue;
     }
     if (ioctl(keyboard->fd, EVIOCGRAB, 1) < 0) {
-      fprintf(stderr, "hotkey: grab %s failed: %s\n", keyboard->path, strerror(errno));
+      LOG_WARN("hotkey: grab %s failed: %s\n", keyboard->path, strerror(errno));
       close(keyboard->fd);
       keyboard->fd = -1;
       continue;
@@ -162,13 +163,13 @@ static int grab_keyboards(Keyboards *keyboards) {
   }
 
   if (grabbed == 0) {
-    fprintf(stderr, "hotkey: failed to grab any keyboard device\n");
+    LOG_ERROR("hotkey: failed to grab any keyboard device\n");
     return -1;
   }
 
-  fprintf(stderr, "hotkey: grabbed_keyboards=%zu passthrough=uinput hotkey=Super+V\n", grabbed);
+  LOG_INFO("hotkey: grabbed_keyboards=%zu passthrough=uinput hotkey=Super+V\n", grabbed);
   for (size_t i = 0; i < keyboards->len; ++i) {
-    if (keyboards->items[i].fd >= 0) fprintf(stderr, "hotkey: keyboard=%s\n", keyboards->items[i].path);
+    if (keyboards->items[i].fd >= 0) LOG_DEBUG("hotkey: keyboard=%s\n", keyboards->items[i].path);
   }
   return 0;
 }
@@ -225,7 +226,7 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
     release_emitted_super_keys(uinput_fd, state);
     state->super_l_consumed = state->super_l_down;
     state->super_r_consumed = state->super_r_down;
-    fprintf(stderr, "hotkey: combo=down\n");
+    LOG_TRACE("hotkey: combo=down\n");
     cb(1, user);
   } else if (state->hotkey_down && (ev->code == KEY_V || is_super_key(ev->code))) {
     pass = 0;
@@ -239,7 +240,7 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
   super_down = state->super_l_down || state->super_r_down;
   if (was_hotkey_down && (!super_down || !state->v_down)) {
     state->hotkey_down = 0;
-    fprintf(stderr, "hotkey: combo=up\n");
+    LOG_TRACE("hotkey: combo=up\n");
     cb(0, user);
   }
 
@@ -248,7 +249,7 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
 
 int stt_hotkey_loop(const char *hotkey, SttHotkeyCallback cb, void *user) {
   if (strcmp(hotkey, "Super+V") != 0 && strcmp(hotkey, "Mod4+V") != 0) {
-    fprintf(stderr, "hotkey: only Super+V is supported in this build\n");
+    LOG_ERROR("hotkey: only Super+V is supported in this build\n");
     return -1;
   }
 
@@ -284,7 +285,7 @@ int stt_hotkey_loop(const char *hotkey, SttHotkeyCallback cb, void *user) {
     int rc = poll(pollfds, keyboards.len, -1);
     if (rc < 0) {
       if (errno == EINTR) continue;
-      fprintf(stderr, "hotkey: poll failed: %s\n", strerror(errno));
+      LOG_ERROR("hotkey: poll failed: %s\n", strerror(errno));
       break;
     }
 
@@ -297,7 +298,7 @@ int stt_hotkey_loop(const char *hotkey, SttHotkeyCallback cb, void *user) {
         if (n < 0) {
           if (errno == EINTR) continue;
           if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          fprintf(stderr, "hotkey: read %s failed: %s\n", keyboards.items[i].path, strerror(errno));
+          LOG_ERROR("hotkey: read %s failed: %s\n", keyboards.items[i].path, strerror(errno));
           break;
         }
         if (n != (ssize_t)sizeof(ev)) break;

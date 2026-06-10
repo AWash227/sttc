@@ -46,6 +46,16 @@ cmake --build build
 STT_KEYBOARD_DEVICE=/dev/input/by-id/YOUR_KEYBOARD-event-kbd ./build/stt run --dry-run
 ```
 
+Logs default to `info`. Use `STT_LOG_LEVEL` for quieter output or deeper tracing:
+
+```sh
+STT_LOG_LEVEL=error ./build/stt run --dry-run
+STT_LOG_LEVEL=debug ./build/stt run --dry-run
+STT_LOG_LEVEL=trace ./build/stt run --dry-run
+```
+
+`info` includes transcripts and compact `perf:` summaries. `debug` adds capture and queue lifecycle details. `trace` adds hotkey transitions and inference stage timings.
+
 The current default dictation model directory is:
 
 ```text
@@ -55,5 +65,7 @@ The current default dictation model directory is:
 The planned dictation command is:
 
 ```sh
-./build/stt run --hotkey Super+V --type-delay-ms 5 --pre-roll-ms 350 --post-roll-ms 250
+./build/stt run --hotkey Super+V --type-delay-ms 0 --pre-roll-ms 350 --post-roll-ms 250
 ```
+
+Typing defaults to `--type-delay-ms 0`. If a target application drops synthetic key events, add a small delay such as `--type-delay-ms 5`.

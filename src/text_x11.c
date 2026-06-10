@@ -1,11 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt/text_x11.h"
+#include "stt/log.h"
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/extensions/XTest.h>
 #include <ctype.h>
-#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -50,12 +50,12 @@ static KeySym keysym_for_ascii(char c, int *shift) {
 int stt_type_text_x11(const char *text, int delay_ms) {
   Display *dpy = XOpenDisplay(NULL);
   if (!dpy) {
-    fprintf(stderr, "failed to open X display\n");
+    LOG_ERROR("failed to open X display\n");
     return -1;
   }
   int event_base = 0, error_base = 0, major = 0, minor = 0;
   if (!XTestQueryExtension(dpy, &event_base, &error_base, &major, &minor)) {
-    fprintf(stderr, "XTest extension is unavailable\n");
+    LOG_ERROR("XTest extension is unavailable\n");
     XCloseDisplay(dpy);
     return -1;
   }
@@ -63,7 +63,7 @@ int stt_type_text_x11(const char *text, int delay_ms) {
   KeyCode shift = XKeysymToKeycode(dpy, XK_Shift_L);
   for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
     if (*p >= 0x80) {
-      fprintf(stderr, "non-ASCII output is not typed by this build; use --print for UTF-8 text\n");
+      LOG_ERROR("non-ASCII output is not typed by this build; use --print for UTF-8 text\n");
       XCloseDisplay(dpy);
       return -1;
     }
@@ -76,14 +76,15 @@ int stt_type_text_x11(const char *text, int delay_ms) {
     XTestFakeKeyEvent(dpy, code, True, CurrentTime);
     XTestFakeKeyEvent(dpy, code, False, CurrentTime);
     if (need_shift) XTestFakeKeyEvent(dpy, shift, False, CurrentTime);
-    XFlush(dpy);
     if (delay_ms > 0) {
+      XFlush(dpy);
       struct timespec ts;
       ts.tv_sec = delay_ms / 1000;
       ts.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
       nanosleep(&ts, NULL);
     }
   }
+  XFlush(dpy);
   XCloseDisplay(dpy);
   return 0;
 }

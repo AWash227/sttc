@@ -21,7 +21,7 @@ static void options_defaults(SttOptions *opts) {
   memset(opts, 0, sizeof(*opts));
   opts->command = STT_CMD_NONE;
   opts->hotkey = "Super+V";
-  opts->type_delay_ms = 5;
+  opts->type_delay_ms = 0;
   opts->max_audio_sec = 25;
   opts->pre_roll_ms = 350;
   opts->post_roll_ms = 250;

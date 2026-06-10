@@ -4,6 +4,7 @@
 #include "stt/cuda_runtime.h"
 #include "stt/hotkey.h"
 #include "stt/infer.h"
+#include "stt/log.h"
 #include "stt/model.h"
 #include "stt/model_install.h"
 #include "stt/text_x11.h"
@@ -19,6 +20,7 @@ typedef struct TranscribeJob {
   unsigned long long capture_id;
   long long release_ms;
   long long enqueue_ms;
+  long long commit_ms;
   struct TranscribeJob *next;
 } TranscribeJob;
 
@@ -47,12 +49,6 @@ typedef struct {
   long long capture_begin_ms;
 } RunState;
 
-static long long now_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static size_t transcribe_queue_depth(TranscribeQueue *queue) {
   pthread_mutex_lock(&queue->mutex);
   size_t depth = queue->depth;
@@ -77,42 +73,60 @@ static void *transcribe_worker(void *arg) {
     size_t depth_after_pop = queue->depth;
     pthread_mutex_unlock(&queue->mutex);
 
-    fprintf(stderr,
-            "run: capture=%llu dequeue wait_ms=%lld queue_depth=%zu\n",
-            job->capture_id, now_ms() - job->enqueue_ms, depth_after_pop);
+    LOG_DEBUG("run: capture=%llu dequeue wait_ms=%lld queue_depth=%zu\n",
+              job->capture_id, stt_now_ms() - job->enqueue_ms, depth_after_pop);
 
     char *text = NULL;
-    long long transcribe_start_ms = now_ms();
+    long long transcribe_start_ms = stt_now_ms();
     int rc = stt_transcribe(queue->model, &job->audio, &text);
-    fprintf(stderr, "run: capture=%llu transcribe rc=%d elapsed_ms=%lld\n",
-            job->capture_id, rc, now_ms() - transcribe_start_ms);
-    fprintf(stderr, "transcript: \"%s\"\n", text ? text : "");
+    long long transcribe_ms = stt_now_ms() - transcribe_start_ms;
+    long long type_ms = 0;
+    LOG_DEBUG("run: capture=%llu transcribe rc=%d elapsed_ms=%lld\n", job->capture_id, rc, transcribe_ms);
+    LOG_INFO("transcript: \"%s\"\n", text ? text : "");
     if (text && text[0]) {
       if (queue->opts->print_only || queue->opts->dry_run) {
         printf("%s\n", text);
         fflush(stdout);
       } else {
-        long long type_wait_start_ms = now_ms();
+        long long type_wait_start_ms = stt_now_ms();
         while (atomic_load(&queue->recording)) {
           const struct timespec delay = {.tv_sec = 0, .tv_nsec = 5000000L};
           nanosleep(&delay, NULL);
         }
-        long long type_wait_ms = now_ms() - type_wait_start_ms;
+        long long type_wait_ms = stt_now_ms() - type_wait_start_ms;
         if (type_wait_ms > 0) {
-          fprintf(stderr, "run: capture=%llu type_wait elapsed_ms=%lld reason=recording_active\n", job->capture_id, type_wait_ms);
+          LOG_DEBUG("run: capture=%llu type_wait elapsed_ms=%lld reason=recording_active\n", job->capture_id, type_wait_ms);
         }
-        long long type_start_ms = now_ms();
+        long long type_start_ms = stt_now_ms();
         stt_type_text_x11(text, queue->opts->type_delay_ms);
-        fprintf(stderr, "run: capture=%llu type elapsed_ms=%lld\n", job->capture_id, now_ms() - type_start_ms);
+        type_ms = stt_now_ms() - type_start_ms;
+        LOG_DEBUG("run: capture=%llu type elapsed_ms=%lld\n", job->capture_id, type_ms);
       }
     } else if (rc != 0) {
-      fprintf(stderr, "no transcript produced\n");
+      LOG_WARN("no transcript produced\n");
     }
     free(text);
     stt_audio_buffer_free(&job->audio);
-    fprintf(stderr,
-            "run: capture=%llu done total_release_to_done_ms=%lld queue_depth=%zu\n",
-            job->capture_id, now_ms() - job->release_ms, depth_after_pop);
+    long long total_ms = stt_now_ms() - job->release_ms;
+    const char *longest = "post_roll";
+    long long longest_ms = job->commit_ms;
+    if (transcribe_ms > longest_ms) {
+      longest = "transcribe";
+      longest_ms = transcribe_ms;
+    }
+    long long queue_wait_ms = transcribe_start_ms - job->enqueue_ms;
+    if (queue_wait_ms > longest_ms) {
+      longest = "queue_wait";
+      longest_ms = queue_wait_ms;
+    }
+    if (type_ms > longest_ms) {
+      longest = "type";
+      longest_ms = type_ms;
+    }
+    LOG_INFO("perf: capture=%llu total_release_to_done_ms=%lld longest=%s longest_ms=%lld post_roll_ms=%lld queue_wait_ms=%lld transcribe_ms=%lld type_ms=%lld queue_depth=%zu\n",
+             job->capture_id, total_ms, longest, longest_ms, job->commit_ms, queue_wait_ms, transcribe_ms, type_ms, depth_after_pop);
+    LOG_DEBUG("run: capture=%llu done total_release_to_done_ms=%lld queue_depth=%zu\n",
+              job->capture_id, total_ms, depth_after_pop);
     free(job);
   }
 }
@@ -127,11 +141,11 @@ static int transcribe_queue_start(TranscribeQueue *queue, const SttOptions *opts
   atomic_init(&queue->recording, 0);
   int rc = pthread_create(&queue->thread, NULL, transcribe_worker, queue);
   if (rc != 0) {
-    fprintf(stderr, "run: transcribe_queue start failed rc=%d\n", rc);
+    LOG_ERROR("run: transcribe_queue start failed rc=%d\n", rc);
     return -1;
   }
   queue->started = 1;
-  fprintf(stderr, "run: transcribe_queue started workers=1\n");
+  LOG_INFO("run: transcribe_queue started workers=1\n");
   return 0;
 }
 
@@ -154,14 +168,20 @@ static void transcribe_queue_stop(TranscribeQueue *queue) {
   pthread_mutex_destroy(&queue->mutex);
 }
 
-static int transcribe_queue_push(TranscribeQueue *queue, unsigned long long capture_id, long long release_ms, SttAudioBuffer *audio, size_t *depth_out) {
+static int transcribe_queue_push(TranscribeQueue *queue,
+                                 unsigned long long capture_id,
+                                 long long release_ms,
+                                 long long commit_ms,
+                                 SttAudioBuffer *audio,
+                                 size_t *depth_out) {
   TranscribeJob *job = calloc(1, sizeof(*job));
   if (!job) return -1;
   job->audio = *audio;
   stt_audio_buffer_init(audio);
   job->capture_id = capture_id;
   job->release_ms = release_ms;
-  job->enqueue_ms = now_ms();
+  job->commit_ms = commit_ms;
+  job->enqueue_ms = stt_now_ms();
 
   pthread_mutex_lock(&queue->mutex);
   if (queue->tail) queue->tail->next = job;
@@ -180,18 +200,18 @@ static void on_hotkey(int pressed, void *user) {
   RunState *state = user;
   unsigned long long event_id = ++state->event_seq;
   size_t queue_depth = transcribe_queue_depth(state->queue);
-  fprintf(stderr, "run: hotkey_event=%llu t_ms=%lld pressed=%d queue_depth=%zu recording=%d\n",
-          event_id, now_ms(), pressed, queue_depth, state->recording);
+  LOG_TRACE("run: hotkey_event=%llu t_ms=%lld pressed=%d queue_depth=%zu recording=%d\n",
+            event_id, stt_now_ms(), pressed, queue_depth, state->recording);
   if (pressed) {
     if (state->recording) {
-      fprintf(stderr, "run: hotkey_event=%llu ignored pressed=1 reason=already_recording\n", event_id);
+      LOG_DEBUG("run: hotkey_event=%llu ignored pressed=1 reason=already_recording\n", event_id);
       return;
     }
     unsigned long long capture_id = ++state->capture_seq;
     int rc = stt_recorder_begin(state->recorder);
-    fprintf(stderr, "run: capture=%llu begin rc=%d\n", capture_id, rc);
+    LOG_DEBUG("run: capture=%llu begin rc=%d\n", capture_id, rc);
     if (rc == 0) {
-      state->capture_begin_ms = now_ms();
+      state->capture_begin_ms = stt_now_ms();
       state->recording = 1;
       atomic_store(&state->queue->recording, 1);
     }
@@ -199,43 +219,45 @@ static void on_hotkey(int pressed, void *user) {
   }
 
   if (!state->recording) {
-    fprintf(stderr, "run: hotkey_event=%llu ignored pressed=0 reason=not_recording\n", event_id);
+    LOG_DEBUG("run: hotkey_event=%llu ignored pressed=0 reason=not_recording\n", event_id);
     return;
   }
   unsigned long long capture_id = state->capture_seq;
   state->recording = 0;
   atomic_store(&state->queue->recording, 0);
-  long long capture_start_ms = now_ms();
+  long long capture_start_ms = stt_now_ms();
   SttAudioBuffer audio;
   stt_audio_buffer_init(&audio);
   int commit_rc = stt_recorder_commit(state->recorder, &audio);
   long long held_ms = capture_start_ms - state->capture_begin_ms;
-  fprintf(stderr, "run: capture=%llu commit rc=%d elapsed_ms=%lld samples=%zu\n",
-          capture_id, commit_rc, now_ms() - capture_start_ms, audio.len);
+  long long commit_ms = stt_now_ms() - capture_start_ms;
+  LOG_DEBUG("run: capture=%llu commit rc=%d elapsed_ms=%lld samples=%zu\n",
+            capture_id, commit_rc, commit_ms, audio.len);
 
   size_t min_samples = (size_t)(16000 * (state->opts->pre_roll_ms + 250) / 1000);
   if (commit_rc != 0 || audio.len <= min_samples) {
-    fprintf(stderr,
-            "run: capture=%llu discarded reason=%s held_ms=%lld samples=%zu min_samples=%zu\n",
-            capture_id, commit_rc != 0 ? "commit_failed" : "too_short_or_preroll_only", held_ms, audio.len, min_samples);
+    LOG_INFO("run: capture=%llu discarded reason=%s held_ms=%lld samples=%zu min_samples=%zu\n",
+             capture_id, commit_rc != 0 ? "commit_failed" : "too_short_or_preroll_only", held_ms, audio.len, min_samples);
     stt_audio_buffer_free(&audio);
     return;
   }
 
   size_t depth = 0;
-  if (transcribe_queue_push(state->queue, capture_id, capture_start_ms, &audio, &depth) != 0) {
-    fprintf(stderr, "run: capture=%llu discarded reason=queue_alloc_failed\n", capture_id);
+  if (transcribe_queue_push(state->queue, capture_id, capture_start_ms, commit_ms, &audio, &depth) != 0) {
+    LOG_ERROR("run: capture=%llu discarded reason=queue_alloc_failed\n", capture_id);
     stt_audio_buffer_free(&audio);
     return;
   }
-  fprintf(stderr, "run: capture=%llu queued elapsed_ms=%lld queue_depth=%zu recording=0\n",
-          capture_id, now_ms() - capture_start_ms, depth);
+  LOG_DEBUG("run: capture=%llu queued elapsed_ms=%lld queue_depth=%zu recording=0\n",
+            capture_id, stt_now_ms() - capture_start_ms, depth);
+  LOG_INFO("perf: capture=%llu release_to_queue_ms=%lld commit_ms=%lld queue_depth=%zu\n",
+           capture_id, stt_now_ms() - capture_start_ms, commit_ms, depth);
 }
 
 static int cmd_test_gpu(void) {
   SttCuda cuda;
   if (stt_cuda_init(&cuda) != 0) {
-    fprintf(stderr, "CUDA test failed: %s\n", stt_cuda_last_error());
+    LOG_ERROR("CUDA test failed: %s\n", stt_cuda_last_error());
     return 1;
   }
   printf("CUDA device: %s\n", cuda.name);
@@ -266,9 +288,9 @@ int main(int argc, char **argv) {
         stt_model_free(model);
         return 1;
       }
-      long long warmup_start_ms = now_ms();
+      long long warmup_start_ms = stt_now_ms();
       int warmup_rc = stt_transcribe_warmup(model);
-      fprintf(stderr, "run: warmup rc=%d elapsed_ms=%lld\n", warmup_rc, now_ms() - warmup_start_ms);
+      LOG_INFO("run: warmup rc=%d elapsed_ms=%lld\n", warmup_rc, stt_now_ms() - warmup_start_ms);
       if (warmup_rc != 0) {
         stt_recorder_close(recorder);
         stt_model_free(model);

@@ -4,4 +4,4 @@
 *.dylib
 *.dll
 *.exe
-build
+build/

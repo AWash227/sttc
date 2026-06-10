@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt/audio.h"
+#include "stt/log.h"
 
 #include <pulse/error.h>
 #include <pulse/simple.h>
@@ -87,7 +88,7 @@ static void *record_thread(void *arg) {
       rec->committing = 0;
       pthread_cond_broadcast(&rec->cond);
       pthread_mutex_unlock(&rec->mutex);
-      fprintf(stderr, "PulseAudio read failed: %s\n", pa_strerror(error));
+      LOG_ERROR("PulseAudio read failed: %s\n", pa_strerror(error));
       break;
     }
 
@@ -146,7 +147,7 @@ int stt_recorder_open(SttRecorder **out, int sample_rate, int max_seconds, int p
   int error = 0;
   rec->pa = pa_simple_new(NULL, "stt", PA_STREAM_RECORD, NULL, "dictation", &ss, NULL, &attr, &error);
   if (!rec->pa) {
-    fprintf(stderr, "PulseAudio open failed: %s\n", pa_strerror(error));
+    LOG_ERROR("PulseAudio open failed: %s\n", pa_strerror(error));
     free(rec->pre);
     free(rec);
     return -1;
@@ -157,7 +158,7 @@ int stt_recorder_open(SttRecorder **out, int sample_rate, int max_seconds, int p
     free(rec);
     return -1;
   }
-  fprintf(stderr, "audio monitor ready: %d Hz mono, pre-roll %.2fs, post-roll %.2fs, max %.2fs, fragment %.3fs\n",
+  LOG_INFO("audio monitor ready: %d Hz mono, pre-roll %.2fs, post-roll %.2fs, max %.2fs, fragment %.3fs\n",
           sample_rate,
           rec->pre_roll_samples / (double)sample_rate,
           rec->post_roll_samples / (double)sample_rate,
@@ -191,7 +192,7 @@ int stt_recorder_begin(SttRecorder *rec) {
   int rc = copy_pre_roll(rec);
   double pre = rec->capture.len / (double)rec->sample_rate;
   pthread_mutex_unlock(&rec->mutex);
-  fprintf(stderr, "recording... included %.2fs pre-roll (%zu samples)\n", pre, rec->capture.len);
+  LOG_DEBUG("recording... included %.2fs pre-roll (%zu samples)\n", pre, rec->capture.len);
   return rc;
 }
 
@@ -203,11 +204,11 @@ int stt_recorder_commit(SttRecorder *rec, SttAudioBuffer *out) {
     if (rec->post_roll_samples <= 0) {
       rec->active = 0;
       rec->committing = 0;
-      fprintf(stderr, "release detected; stopping immediately with no post-roll\n");
+      LOG_DEBUG("release detected; stopping immediately with no post-roll\n");
     } else {
       rec->committing = 1;
       rec->post_target_len = rec->capture.len + (size_t)rec->post_roll_samples;
-      fprintf(stderr, "release detected; collecting %.2fs post-roll target_samples=%zu current_samples=%zu\n",
+      LOG_DEBUG("release detected; collecting %.2fs post-roll target_samples=%zu current_samples=%zu\n",
               rec->post_roll_samples / (double)rec->sample_rate, rec->post_target_len, rec->capture.len);
       while (rec->active && rec->committing && !rec->read_error) {
         pthread_cond_wait(&rec->cond, &rec->mutex);
@@ -228,6 +229,6 @@ int stt_recorder_commit(SttRecorder *rec, SttAudioBuffer *out) {
   }
   double seconds = out->len / (double)out->sample_rate;
   pthread_mutex_unlock(&rec->mutex);
-  fprintf(stderr, "committed %.2fs audio (%zu samples)\n", seconds, out->len);
+  LOG_DEBUG("committed %.2fs audio (%zu samples)\n", seconds, out->len);
   return rec->read_error ? -1 : 0;
 }
