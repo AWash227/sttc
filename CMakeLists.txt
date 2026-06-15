@@ -24,4 +24,21 @@ target_compile_options(stt PRIVATE -Wall -Wextra -Wpedantic ${STT_DEPS_CFLAGS_OT
 target_link_directories(stt PRIVATE ${STT_DEPS_LIBRARY_DIRS})
 target_link_libraries(stt PRIVATE ${STT_DEPS_LIBRARIES} m pthread)
 
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(hotkey_tests tests/hotkey_tests.c src/log.c)
+  target_include_directories(hotkey_tests PRIVATE include)
+  target_compile_options(hotkey_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME hotkey_tests COMMAND hotkey_tests)
+
+  add_executable(audio_tests tests/audio_tests.c src/audio.c src/log.c)
+  target_compile_definitions(audio_tests PRIVATE STT_TESTING)
+  target_include_directories(audio_tests PRIVATE include)
+  target_include_directories(audio_tests SYSTEM PRIVATE ${STT_DEPS_INCLUDE_DIRS})
+  target_compile_options(audio_tests PRIVATE -Wall -Wextra -Wpedantic ${STT_DEPS_CFLAGS_OTHER})
+  target_link_directories(audio_tests PRIVATE ${STT_DEPS_LIBRARY_DIRS})
+  target_link_libraries(audio_tests PRIVATE ${STT_DEPS_LIBRARIES} pthread)
+  add_test(NAME audio_tests COMMAND audio_tests)
+endif()
+
 install(TARGETS stt RUNTIME DESTINATION bin)

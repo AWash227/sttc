@@ -5,6 +5,7 @@
 
 typedef struct {
   const char *model_dir;
+  const char *log_path;
   int type_delay_ms;
   int max_audio_sec;
   int pre_roll_ms;

@@ -264,7 +264,7 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
   char *encoder_path = stt_path_join(model_dir, encoder_file);
   char *decoder_path = stt_path_join(model_dir, decoder_file);
   if (!encoder_path || !decoder_path) goto fail;
-  LOG_INFO("infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
+  LOG_DEBUG("infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
 
   if (ort_check(ort, ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "stt", &ort->env), "CreateEnv") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSessionOptions(&ort->options), "CreateSessionOptions") != 0) goto fail;
@@ -273,7 +273,7 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
 
   int cuda_ep = 0;
   if (!cuda_device_available()) {
-    LOG_INFO("infer: ort_init cuda_ep_configured=0 reason=\"no CUDA device available\"\n");
+    LOG_DEBUG("infer: ort_init cuda_ep_configured=0 reason=\"no CUDA device available\"\n");
   } else {
     const char *algo_name = NULL;
     OrtCudnnConvAlgoSearch algo_search = cudnn_algo_search_from_env(&algo_name);
@@ -290,13 +290,13 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
       ort->api->ReleaseStatus(cuda_status);
     } else {
       cuda_ep = 1;
-      LOG_INFO("infer: ort_init cuda_ep_configured=1 cudnn_conv_algo_search=%s\n", algo_name);
+      LOG_DEBUG("infer: ort_init cuda_ep_configured=1 cudnn_conv_algo_search=%s\n", algo_name);
     }
   }
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->memory), "CreateCpuMemoryInfo") != 0) goto fail;
-  LOG_INFO("infer: ort_init done elapsed_ms=%lld cuda_ep=%d\n", stt_now_ms() - start_ms, cuda_ep);
+  LOG_DEBUG("infer: ort_init done elapsed_ms=%lld cuda_ep=%d\n", stt_now_ms() - start_ms, cuda_ep);
 
   free(encoder_path);
   free(decoder_path);
@@ -324,7 +324,7 @@ static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
     return 0;
   }
 
-  LOG_INFO("infer: runtime_cache hit=0 loading model_dir=%s variant=%s\n", model_dir, variant);
+  LOG_DEBUG("infer: runtime_cache hit=0 loading model_dir=%s variant=%s\n", model_dir, variant);
   tdt_runtime_free(&g_tdt_runtime);
   char *vocab_path = stt_path_join(model_dir, "vocab.txt");
   if (!vocab_path) return -1;
@@ -346,7 +346,7 @@ static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
     return -1;
   }
   g_tdt_runtime.ready = 1;
-  LOG_INFO("infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s\n",
+  LOG_DEBUG("infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s\n",
            stt_now_ms() - start_ms, g_tdt_runtime.vocab.count, g_tdt_runtime.variant);
   *runtime_out = &g_tdt_runtime;
   return 0;
@@ -589,7 +589,7 @@ done:
   }
   long long measured_ms = feature_ms + runtime_ms + encoder_ms + decode_stats.decoder_ms + text_ms;
   long long overhead_ms = total_ms > measured_ms ? total_ms - measured_ms : 0;
-  LOG_INFO("perf: infer total_ms=%lld rtf=%.3f longest=%s longest_ms=%lld features_ms=%lld runtime_ms=%lld encoder_ms=%lld decoder_ms=%lld text_ms=%lld overhead_ms=%lld rc=%d\n",
+  LOG_DEBUG("perf: infer total_ms=%lld rtf=%.3f longest=%s longest_ms=%lld features_ms=%lld runtime_ms=%lld encoder_ms=%lld decoder_ms=%lld text_ms=%lld overhead_ms=%lld rc=%d\n",
            total_ms,
            elapsed_rtf(total_ms, audio_sec),
            longest,
@@ -667,7 +667,7 @@ int stt_transcribe_warmup(SttModel *model) {
   TdtRuntime *runtime = NULL;
   int rc = tdt_runtime_get(stt_model_dir(model), &runtime);
   if (rc == 0) rc = tdt_runtime_prime(runtime);
-  LOG_INFO("infer: warmup elapsed_ms=%lld rc=%d\n", stt_now_ms() - start_ms, rc);
+  LOG_DEBUG("infer: warmup elapsed_ms=%lld rc=%d\n", stt_now_ms() - start_ms, rc);
   return rc;
 }
 

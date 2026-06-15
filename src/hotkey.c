@@ -124,7 +124,23 @@ static int emit_event(int fd, unsigned short type, unsigned short code, int valu
   ev.type = type;
   ev.code = code;
   ev.value = value;
-  return write(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev) ? 0 : -1;
+  size_t offset = 0;
+  while (offset < sizeof(ev)) {
+    ssize_t n = write(fd, (const char *)&ev + offset, sizeof(ev) - offset);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pollfd = {.fd = fd, .events = POLLOUT};
+        if (poll(&pollfd, 1, 100) >= 0) continue;
+      }
+      LOG_WARN("hotkey: write event failed type=%u code=%u value=%d error=%s\n",
+               type, code, value, strerror(errno));
+      return -1;
+    }
+    if (n == 0) return -1;
+    offset += (size_t)n;
+  }
+  return 0;
 }
 
 static int emit_key(int fd, unsigned short code, int value) {
@@ -133,7 +149,23 @@ static int emit_key(int fd, unsigned short code, int value) {
 }
 
 static int forward_event(int fd, const struct input_event *ev) {
-  return write(fd, ev, sizeof(*ev)) == (ssize_t)sizeof(*ev) ? 0 : -1;
+  size_t offset = 0;
+  while (offset < sizeof(*ev)) {
+    ssize_t n = write(fd, (const char *)ev + offset, sizeof(*ev) - offset);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pollfd = {.fd = fd, .events = POLLOUT};
+        if (poll(&pollfd, 1, 100) >= 0) continue;
+      }
+      LOG_WARN("hotkey: forward event failed type=%u code=%u value=%d error=%s\n",
+               ev->type, ev->code, ev->value, strerror(errno));
+      return -1;
+    }
+    if (n == 0) return -1;
+    offset += (size_t)n;
+  }
+  return 0;
 }
 
 static int open_virtual_keyboard(void) {
@@ -242,7 +274,8 @@ static int grab_keyboards(Keyboards *keyboards) {
     return -1;
   }
 
-  LOG_INFO("hotkey: grabbed_keyboards=%zu passthrough=uinput hotkey=Super+V\n", grabbed);
+  LOG_INFO("Hotkey ready: hold Super+V to dictate\n");
+  LOG_DEBUG("hotkey: grabbed_keyboards=%zu passthrough=uinput hotkey=Super+V\n", grabbed);
   for (size_t i = 0; i < keyboards->len; ++i) {
     if (keyboards->items[i].fd >= 0) LOG_DEBUG("hotkey: keyboard=%s\n", keyboards->items[i].path);
   }
@@ -251,23 +284,19 @@ static int grab_keyboards(Keyboards *keyboards) {
 
 static void release_emitted_super_keys(int uinput_fd, HotkeyState *state) {
   if (state->super_l_emitted) {
-    emit_key(uinput_fd, KEY_LEFTMETA, 0);
-    state->super_l_emitted = 0;
+    if (emit_key(uinput_fd, KEY_LEFTMETA, 0) == 0) state->super_l_emitted = 0;
   }
   if (state->super_r_emitted) {
-    emit_key(uinput_fd, KEY_RIGHTMETA, 0);
-    state->super_r_emitted = 0;
+    if (emit_key(uinput_fd, KEY_RIGHTMETA, 0) == 0) state->super_r_emitted = 0;
   }
 }
 
 static void flush_pending_super_keys(int uinput_fd, HotkeyState *state) {
   if (state->super_l_down && !state->super_l_emitted) {
-    emit_key(uinput_fd, KEY_LEFTMETA, 1);
-    state->super_l_emitted = 1;
+    if (emit_key(uinput_fd, KEY_LEFTMETA, 1) == 0) state->super_l_emitted = 1;
   }
   if (state->super_r_down && !state->super_r_emitted) {
-    emit_key(uinput_fd, KEY_RIGHTMETA, 1);
-    state->super_r_emitted = 1;
+    if (emit_key(uinput_fd, KEY_RIGHTMETA, 1) == 0) state->super_r_emitted = 1;
   }
 }
 
@@ -277,13 +306,18 @@ static void handle_super_release(int uinput_fd, HotkeyState *state, unsigned sho
 
   if (*consumed) {
     *consumed = 0;
+    if (*emitted && emit_key(uinput_fd, code, 0) == 0) *emitted = 0;
   } else if (*emitted) {
-    emit_key(uinput_fd, code, 0);
-    *emitted = 0;
+    if (emit_key(uinput_fd, code, 0) == 0) *emitted = 0;
   } else {
     emit_key(uinput_fd, code, 1);
     emit_key(uinput_fd, code, 0);
   }
+}
+
+static void clear_consumed_super(HotkeyState *state, unsigned short code) {
+  if (code == KEY_LEFTMETA) state->super_l_consumed = 0;
+  if (code == KEY_RIGHTMETA) state->super_r_consumed = 0;
 }
 
 static int handle_key_event(int uinput_fd, HotkeyState *state, const struct input_event *ev, SttHotkeyCallback cb, void *user) {
@@ -305,6 +339,10 @@ static int handle_key_event(int uinput_fd, HotkeyState *state, const struct inpu
     cb(1, user);
   } else if (state->hotkey_down && (ev->code == KEY_V || is_super_key(ev->code))) {
     pass = 0;
+    if (is_super_key(ev->code) && ev->value == 0) {
+      clear_consumed_super(state, ev->code);
+      release_emitted_super_keys(uinput_fd, state);
+    }
   } else if (!state->hotkey_down && is_super_key(ev->code)) {
     pass = 0;
     if (ev->value == 0) handle_super_release(uinput_fd, state, ev->code);
@@ -408,6 +446,7 @@ int stt_hotkey_loop(SttHotkeyCallback cb, void *user) {
   }
 
   if (g_stop_requested) loop_rc = 0;
+  release_emitted_super_keys(uinput_fd, &state);
   free(pollfds);
   ioctl(uinput_fd, UI_DEV_DESTROY);
   close(uinput_fd);

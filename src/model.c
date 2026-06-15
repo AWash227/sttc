@@ -41,7 +41,7 @@ int stt_model_load(SttModel **model_out, const char *model_dir_arg) {
     return -1;
   }
 
-  LOG_INFO("loaded TDT ONNX model: %s\n", model->model_dir);
+  LOG_INFO("Loaded speech model: %s\n", model->model_dir);
   *model_out = model;
   return 0;
 }

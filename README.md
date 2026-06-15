@@ -33,6 +33,7 @@ cmake --build build
 ```
 
 With no subcommand, `stt` runs the dictation loop with the same defaults as `stt run`.
+Use `--log file.md` to also keep a continuous microphone transcription log, one utterance per line, while preserving the normal `Super+V` dictation behavior.
 
 `run` grabs `/dev/input/by-id/*-event-kbd` and creates a `/dev/uinput` passthrough keyboard so the hotkey works even when virt-manager has focus. If automatic keyboard discovery is wrong, set:
 
@@ -48,7 +49,7 @@ STT_LOG_LEVEL=debug ./build/stt run --dry-run
 STT_LOG_LEVEL=trace ./build/stt run --dry-run
 ```
 
-`info` includes transcripts and compact `perf:` summaries. `debug` adds capture and queue lifecycle details. `trace` adds hotkey transitions and inference stage timings.
+`info` shows user-facing startup, listening, transcription, and typed/logged transcript messages. `debug` adds performance, capture, queue, and runtime details. `trace` adds hotkey transitions and inference stage timings.
 
 The current default dictation model directory is:
 
@@ -63,4 +64,5 @@ The planned dictation command is:
 ```
 
 Typing defaults to `--type-delay-ms 0`. If a target application drops synthetic key events, add a small delay such as `--type-delay-ms 5`.
+`--max-audio-sec` controls the maximum inference segment size. Longer `Super+V` holds are split into ordered segments instead of dropping speech after the limit.
 Post-roll defaults to `--post-roll-ms 0`; add a small value if a setup starts clipping final words.

@@ -30,6 +30,8 @@ int stt_parse_args(int argc, char **argv, SttConfig *config) {
   for (int i = arg_start; i < argc; ++i) {
     if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
       config->model_dir = argv[++i];
+    } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+      config->log_path = argv[++i];
     } else if (strcmp(argv[i], "--type-delay-ms") == 0 && i + 1 < argc) {
       if (parse_int(argv[++i], &config->type_delay_ms) != 0) return -1;
     } else if (strcmp(argv[i], "--max-audio-sec") == 0 && i + 1 < argc) {
@@ -52,6 +54,6 @@ int stt_parse_args(int argc, char **argv, SttConfig *config) {
 void stt_print_usage(const char *argv0) {
   fprintf(stderr,
           "usage:\n"
-          "  %s [run] [--model-dir DIR] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
+          "  %s [run] [--model-dir DIR] [--log FILE] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
           argv0);
 }
