@@ -1,5 +1,5 @@
-#ifndef STT_HOTKEY_H
-#define STT_HOTKEY_H
+#ifndef STT_HOTKEY_BACKEND_INTERNAL_H
+#define STT_HOTKEY_BACKEND_INTERNAL_H
 
 typedef void (*SttHotkeyCallback)(int pressed, void *user);
 

@@ -8,10 +8,14 @@
 static void config_defaults(SttConfig *config) {
   memset(config, 0, sizeof(*config));
   config->model_dir = "~/.models/parakeet-tdt";
+  config->infer_provider = "auto";
+  config->model_variant = "auto";
   config->type_delay_ms = 0;
   config->max_audio_sec = 25;
   config->pre_roll_ms = 350;
   config->post_roll_ms = 0;
+  config->device_id = 0;
+  config->threads = 1;
 }
 
 static int parse_int(const char *s, int *out) {
@@ -40,6 +44,14 @@ int stt_parse_args(int argc, char **argv, SttConfig *config) {
       if (parse_int(argv[++i], &config->pre_roll_ms) != 0) return -1;
     } else if (strcmp(argv[i], "--post-roll-ms") == 0 && i + 1 < argc) {
       if (parse_int(argv[++i], &config->post_roll_ms) != 0) return -1;
+    } else if (strcmp(argv[i], "--infer-provider") == 0 && i + 1 < argc) {
+      config->infer_provider = argv[++i];
+    } else if (strcmp(argv[i], "--device-id") == 0 && i + 1 < argc) {
+      if (parse_int(argv[++i], &config->device_id) != 0) return -1;
+    } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+      if (parse_int(argv[++i], &config->threads) != 0) return -1;
+    } else if (strcmp(argv[i], "--model-variant") == 0 && i + 1 < argc) {
+      config->model_variant = argv[++i];
     } else if (strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = 1;
     } else if (strcmp(argv[i], "--print") == 0) {
@@ -54,6 +66,8 @@ int stt_parse_args(int argc, char **argv, SttConfig *config) {
 void stt_print_usage(const char *argv0) {
   fprintf(stderr,
           "usage:\n"
-          "  %s [run] [--model-dir DIR] [--log FILE] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N] [--dry-run|--print]\n",
+          "  %s [run] [--model-dir DIR] [--log FILE] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N]\n"
+          "     [--infer-provider auto|cpu|cuda|directml|coreml|openvino|migraphx|xnnpack] [--device-id N] [--threads N]\n"
+          "     [--model-variant auto|fp32|int8] [--dry-run|--print]\n",
           argv0);
 }

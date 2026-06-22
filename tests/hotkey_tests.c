@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define STT_TESTING
-#include "../src/hotkey.c"
+#include "../src/hotkey/linux_evdev.c"
 
 #include <assert.h>
 

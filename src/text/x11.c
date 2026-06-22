@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
-#include "stt/text_x11.h"
 #include "stt/log.h"
+
+#include "backend.h"
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
@@ -67,7 +68,11 @@ static int type_ascii_char(Display *dpy, KeyCode shift, char c, int delay_ms) {
   return 0;
 }
 
-int stt_type_phrase_x11(const char *text, int delay_ms) {
+const char *stt_text_backend_name(void) {
+  return "x11";
+}
+
+int stt_text_output_write(const char *text, int delay_ms) {
   Display *dpy = XOpenDisplay(NULL);
   if (!dpy) {
     LOG_ERROR("failed to open X display\n");

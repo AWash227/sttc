@@ -4,7 +4,6 @@
 #include "stt/fs.h"
 #include "stt/log.h"
 
-#include <cuda.h>
 #include <onnxruntime_c_api.h>
 #include <errno.h>
 #include <float.h>
@@ -46,6 +45,7 @@ typedef struct {
 typedef struct {
   char *model_dir;
   char *variant;
+  char *provider;
   TdtVocab vocab;
   OrtTdt ort;
   int ready;
@@ -57,11 +57,62 @@ static double elapsed_rtf(long long elapsed_ms, double audio_sec) {
   return audio_sec > 0.0 ? (double)elapsed_ms / (audio_sec * 1000.0) : 0.0;
 }
 
-static const char *requested_tdt_variant(void) {
-  const char *variant = getenv("STT_TDT_VARIANT");
-  if (!variant || !*variant || strcmp(variant, "auto") == 0) return "fp32";
+typedef enum {
+  STT_INFER_PROVIDER_AUTO = 0,
+  STT_INFER_PROVIDER_CPU,
+  STT_INFER_PROVIDER_CUDA,
+  STT_INFER_PROVIDER_DIRECTML,
+  STT_INFER_PROVIDER_COREML,
+  STT_INFER_PROVIDER_OPENVINO,
+  STT_INFER_PROVIDER_MIGRAPHX,
+  STT_INFER_PROVIDER_XNNPACK,
+  STT_INFER_PROVIDER_UNKNOWN,
+} SttInferProvider;
+
+static int streq(const char *a, const char *b) {
+  return a && b && strcmp(a, b) == 0;
+}
+
+static SttInferProvider parse_provider(const char *provider) {
+  if (!provider || !*provider || streq(provider, "auto")) return STT_INFER_PROVIDER_AUTO;
+  if (streq(provider, "cpu")) return STT_INFER_PROVIDER_CPU;
+  if (streq(provider, "cuda")) return STT_INFER_PROVIDER_CUDA;
+  if (streq(provider, "directml")) return STT_INFER_PROVIDER_DIRECTML;
+  if (streq(provider, "coreml")) return STT_INFER_PROVIDER_COREML;
+  if (streq(provider, "openvino")) return STT_INFER_PROVIDER_OPENVINO;
+  if (streq(provider, "migraphx")) return STT_INFER_PROVIDER_MIGRAPHX;
+  if (streq(provider, "xnnpack")) return STT_INFER_PROVIDER_XNNPACK;
+  return STT_INFER_PROVIDER_UNKNOWN;
+}
+
+static const char *provider_name(SttInferProvider provider) {
+  switch (provider) {
+    case STT_INFER_PROVIDER_AUTO: return "auto";
+    case STT_INFER_PROVIDER_CPU: return "cpu";
+    case STT_INFER_PROVIDER_CUDA: return "cuda";
+    case STT_INFER_PROVIDER_DIRECTML: return "directml";
+    case STT_INFER_PROVIDER_COREML: return "coreml";
+    case STT_INFER_PROVIDER_OPENVINO: return "openvino";
+    case STT_INFER_PROVIDER_MIGRAPHX: return "migraphx";
+    case STT_INFER_PROVIDER_XNNPACK: return "xnnpack";
+    case STT_INFER_PROVIDER_UNKNOWN: return "unknown";
+  }
+  return "unknown";
+}
+
+static const char *requested_provider_name(const SttConfig *config) {
+  return config && config->infer_provider ? config->infer_provider : "auto";
+}
+
+static const char *requested_tdt_variant(const SttConfig *config, SttInferProvider provider) {
+  const char *variant = config ? config->model_variant : NULL;
+  if (!variant || !*variant) variant = getenv("STT_TDT_VARIANT");
+  if (!variant || !*variant || strcmp(variant, "auto") == 0) {
+    if (provider == STT_INFER_PROVIDER_CPU || provider == STT_INFER_PROVIDER_CUDA) return "fp32";
+    return "fp32";
+  }
   if (strcmp(variant, "fp32") == 0 || strcmp(variant, "int8") == 0) return variant;
-  LOG_WARN("infer: unknown STT_TDT_VARIANT=%s using=fp32\n", variant);
+  LOG_WARN("infer: unknown model variant=%s using=fp32\n", variant);
   return "fp32";
 }
 
@@ -73,14 +124,22 @@ static int file_exists_in_dir(const char *dir, const char *name) {
   return exists;
 }
 
-static void tdt_variant_files(const char *model_dir, const char **variant_out, const char **encoder_file_out, const char **decoder_file_out) {
-  const char *variant = requested_tdt_variant();
+static void tdt_variant_files(const char *model_dir,
+                              const SttConfig *config,
+                              SttInferProvider provider,
+                              const char **variant_out,
+                              const char **encoder_file_out,
+                              const char **decoder_file_out) {
+  const char *variant = requested_tdt_variant(config, provider);
   const char *encoder_file = "encoder-model.onnx";
   const char *decoder_file = "decoder_joint-model.onnx";
 
   if (strcmp(variant, "int8") == 0) {
-    if (file_exists_in_dir(model_dir, "encoder-model.int8.onnx") &&
-        file_exists_in_dir(model_dir, "decoder_joint-model.int8.onnx")) {
+    if (provider != STT_INFER_PROVIDER_CPU && provider != STT_INFER_PROVIDER_CUDA) {
+      LOG_WARN("infer: tdt_variant=int8 is not verified for provider=%s; falling back to fp32\n", provider_name(provider));
+      variant = "fp32";
+    } else if (file_exists_in_dir(model_dir, "encoder-model.int8.onnx") &&
+               file_exists_in_dir(model_dir, "decoder_joint-model.int8.onnx")) {
       encoder_file = "encoder-model.int8.onnx";
       decoder_file = "decoder_joint-model.int8.onnx";
     } else {
@@ -147,11 +206,179 @@ static int ort_check(OrtTdt *ort, OrtStatus *status, const char *what) {
   return -1;
 }
 
-static int cuda_device_available(void) {
-  int count = 0;
-  if (cuInit(0) != CUDA_SUCCESS) return 0;
-  if (cuDeviceGetCount(&count) != CUDA_SUCCESS) return 0;
-  return count > 0;
+static int provider_compiled(SttInferProvider provider) {
+  switch (provider) {
+    case STT_INFER_PROVIDER_CPU:
+      return 1;
+    case STT_INFER_PROVIDER_CUDA:
+      return STT_ENABLE_CUDA;
+    case STT_INFER_PROVIDER_DIRECTML:
+      return STT_ENABLE_DIRECTML;
+    case STT_INFER_PROVIDER_COREML:
+      return STT_ENABLE_COREML;
+    case STT_INFER_PROVIDER_OPENVINO:
+      return STT_ENABLE_OPENVINO;
+    case STT_INFER_PROVIDER_MIGRAPHX:
+      return STT_ENABLE_MIGRAPHX;
+    case STT_INFER_PROVIDER_XNNPACK:
+      return STT_ENABLE_XNNPACK;
+    case STT_INFER_PROVIDER_AUTO:
+    case STT_INFER_PROVIDER_UNKNOWN:
+      return 0;
+  }
+  return 0;
+}
+
+static void log_available_providers(OrtTdt *ort) {
+  char **providers = NULL;
+  int len = 0;
+  OrtStatus *status = ort->api->GetAvailableProviders(&providers, &len);
+  if (status) {
+    LOG_DEBUG("infer: available_providers error=\"%s\"\n", ort->api->GetErrorMessage(status));
+    ort->api->ReleaseStatus(status);
+    return;
+  }
+  for (int i = 0; i < len; ++i) {
+    LOG_DEBUG("infer: available_provider=%s\n", providers[i]);
+  }
+  OrtStatus *release_status = ort->api->ReleaseAvailableProviders(providers, len);
+  if (release_status) ort->api->ReleaseStatus(release_status);
+}
+
+static int provider_status(OrtTdt *ort,
+                           OrtStatus *status,
+                           SttInferProvider provider,
+                           int explicit_request,
+                           const char *provider_detail,
+                           const char **selected_provider_out) {
+  if (!status) {
+    *selected_provider_out = provider_name(provider);
+    LOG_DEBUG("infer: provider=%s configured detail=%s\n", provider_name(provider), provider_detail ? provider_detail : "");
+    return 1;
+  }
+
+  const char *message = ort->api->GetErrorMessage(status);
+  if (explicit_request) {
+    LOG_ERROR("infer: requested provider=%s unavailable: %s\n", provider_name(provider), message);
+    ort->api->ReleaseStatus(status);
+    return -1;
+  }
+  LOG_DEBUG("infer: provider=%s unavailable reason=\"%s\"\n", provider_name(provider), message);
+  ort->api->ReleaseStatus(status);
+  return 0;
+}
+
+static int append_generic_provider(OrtTdt *ort,
+                                   SttInferProvider provider,
+                                   const char *ort_provider_name,
+                                   const char *option_key,
+                                   const char *option_value,
+                                   int explicit_request,
+                                   const char **selected_provider_out) {
+  if (!provider_compiled(provider)) {
+    if (explicit_request) {
+      LOG_ERROR("infer: requested provider=%s is not enabled in this build\n", provider_name(provider));
+      return -1;
+    }
+    LOG_DEBUG("infer: provider=%s skipped reason=not_enabled\n", provider_name(provider));
+    return 0;
+  }
+  const char *keys[1] = {option_key};
+  const char *values[1] = {option_value};
+  size_t count = option_key && option_value ? 1 : 0;
+  OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider(ort->options, ort_provider_name, keys, values, count);
+  return provider_status(ort, status, provider, explicit_request, ort_provider_name, selected_provider_out);
+}
+
+static int append_provider(OrtTdt *ort,
+                           SttInferProvider provider,
+                           const SttConfig *config,
+                           int explicit_request,
+                           const char **selected_provider_out) {
+  if (provider == STT_INFER_PROVIDER_CPU) {
+    *selected_provider_out = "cpu";
+    LOG_DEBUG("infer: provider=cpu configured detail=default\n");
+    return 1;
+  }
+  if (!provider_compiled(provider)) {
+    if (explicit_request) {
+      LOG_ERROR("infer: requested provider=%s is not enabled in this build\n", provider_name(provider));
+      return -1;
+    }
+    LOG_DEBUG("infer: provider=%s skipped reason=not_enabled\n", provider_name(provider));
+    return 0;
+  }
+
+  int device_id = config ? config->device_id : 0;
+  switch (provider) {
+    case STT_INFER_PROVIDER_CUDA: {
+      const char *algo_name = NULL;
+      OrtCudnnConvAlgoSearch algo_search = cudnn_algo_search_from_env(&algo_name);
+      OrtCUDAProviderOptions options = {
+        .device_id = device_id,
+        .cudnn_conv_algo_search = algo_search,
+        .gpu_mem_limit = SIZE_MAX,
+        .arena_extend_strategy = 1,
+        .do_copy_in_default_stream = 1,
+      };
+      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_CUDA(ort->options, &options);
+      return provider_status(ort, status, provider, explicit_request, algo_name, selected_provider_out);
+    }
+    case STT_INFER_PROVIDER_MIGRAPHX: {
+      OrtMIGraphXProviderOptions options;
+      memset(&options, 0, sizeof(options));
+      options.device_id = device_id;
+      options.migraphx_mem_limit = SIZE_MAX;
+      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_MIGraphX(ort->options, &options);
+      return provider_status(ort, status, provider, explicit_request, "MIGraphX", selected_provider_out);
+    }
+    case STT_INFER_PROVIDER_OPENVINO:
+      return append_generic_provider(ort, provider, "OpenVINO", NULL, NULL, explicit_request, selected_provider_out);
+    case STT_INFER_PROVIDER_DIRECTML:
+      return append_generic_provider(ort, provider, "DML", NULL, NULL, explicit_request, selected_provider_out);
+    case STT_INFER_PROVIDER_COREML:
+      return append_generic_provider(ort, provider, "CoreML", NULL, NULL, explicit_request, selected_provider_out);
+    case STT_INFER_PROVIDER_XNNPACK: {
+      char threads[16];
+      snprintf(threads, sizeof(threads), "%d", config && config->threads > 0 ? config->threads : 1);
+      return append_generic_provider(ort, provider, "XNNPACK", "intra_op_num_threads", threads, explicit_request, selected_provider_out);
+    }
+    case STT_INFER_PROVIDER_AUTO:
+    case STT_INFER_PROVIDER_CPU:
+    case STT_INFER_PROVIDER_UNKNOWN:
+      break;
+  }
+  return 0;
+}
+
+static int configure_providers(OrtTdt *ort, const SttConfig *config, const char **selected_provider_out) {
+  SttInferProvider requested = parse_provider(requested_provider_name(config));
+  if (requested == STT_INFER_PROVIDER_UNKNOWN) {
+    LOG_ERROR("infer: unknown provider=%s\n", requested_provider_name(config));
+    return -1;
+  }
+
+  log_available_providers(ort);
+  if (requested != STT_INFER_PROVIDER_AUTO) {
+    return append_provider(ort, requested, config, 1, selected_provider_out) < 0 ? -1 : 0;
+  }
+
+  static const SttInferProvider auto_order[] = {
+    STT_INFER_PROVIDER_CUDA,
+    STT_INFER_PROVIDER_DIRECTML,
+    STT_INFER_PROVIDER_COREML,
+    STT_INFER_PROVIDER_OPENVINO,
+    STT_INFER_PROVIDER_MIGRAPHX,
+    STT_INFER_PROVIDER_XNNPACK,
+  };
+  for (size_t i = 0; i < sizeof(auto_order) / sizeof(auto_order[0]); ++i) {
+    int rc = append_provider(ort, auto_order[i], config, 0, selected_provider_out);
+    if (rc < 0) return -1;
+    if (rc > 0) return 0;
+  }
+  *selected_provider_out = "cpu";
+  LOG_DEBUG("infer: provider=cpu configured detail=auto_fallback\n");
+  return 0;
 }
 
 static void tdt_vocab_free(TdtVocab *vocab) {
@@ -254,10 +481,17 @@ static void tdt_runtime_free(TdtRuntime *runtime) {
   tdt_vocab_free(&runtime->vocab);
   free(runtime->model_dir);
   free(runtime->variant);
+  free(runtime->provider);
   memset(runtime, 0, sizeof(*runtime));
 }
 
-static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant, const char *encoder_file, const char *decoder_file) {
+static int ort_tdt_init(OrtTdt *ort,
+                        const SttConfig *config,
+                        const char *model_dir,
+                        const char *variant,
+                        const char *encoder_file,
+                        const char *decoder_file,
+                        const char **selected_provider_out) {
   long long start_ms = stt_now_ms();
   memset(ort, 0, sizeof(*ort));
   ort->api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -268,35 +502,15 @@ static int ort_tdt_init(OrtTdt *ort, const char *model_dir, const char *variant,
 
   if (ort_check(ort, ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "stt", &ort->env), "CreateEnv") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSessionOptions(&ort->options), "CreateSessionOptions") != 0) goto fail;
-  ort_check(ort, ort->api->SetIntraOpNumThreads(ort->options, 1), "SetIntraOpNumThreads");
+  int threads = config && config->threads > 0 ? config->threads : 1;
+  ort_check(ort, ort->api->SetIntraOpNumThreads(ort->options, threads), "SetIntraOpNumThreads");
   ort_check(ort, ort->api->SetSessionGraphOptimizationLevel(ort->options, ORT_ENABLE_ALL), "SetSessionGraphOptimizationLevel");
-
-  int cuda_ep = 0;
-  if (!cuda_device_available()) {
-    LOG_DEBUG("infer: ort_init cuda_ep_configured=0 reason=\"no CUDA device available\"\n");
-  } else {
-    const char *algo_name = NULL;
-    OrtCudnnConvAlgoSearch algo_search = cudnn_algo_search_from_env(&algo_name);
-    OrtCUDAProviderOptions cuda_options = {
-      .device_id = 0,
-      .cudnn_conv_algo_search = algo_search,
-      .gpu_mem_limit = SIZE_MAX,
-      .arena_extend_strategy = 1,
-      .do_copy_in_default_stream = 1,
-    };
-    OrtStatus *cuda_status = ort->api->SessionOptionsAppendExecutionProvider_CUDA(ort->options, &cuda_options);
-    if (cuda_status) {
-      LOG_WARN("infer: ort_init cuda_ep_configured=0 reason=\"%s\"\n", ort->api->GetErrorMessage(cuda_status));
-      ort->api->ReleaseStatus(cuda_status);
-    } else {
-      cuda_ep = 1;
-      LOG_DEBUG("infer: ort_init cuda_ep_configured=1 cudnn_conv_algo_search=%s\n", algo_name);
-    }
-  }
+  if (configure_providers(ort, config, selected_provider_out) != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->memory), "CreateCpuMemoryInfo") != 0) goto fail;
-  LOG_DEBUG("infer: ort_init done elapsed_ms=%lld cuda_ep=%d\n", stt_now_ms() - start_ms, cuda_ep);
+  LOG_DEBUG("infer: ort_init done elapsed_ms=%lld provider=%s threads=%d device_id=%d\n",
+            stt_now_ms() - start_ms, *selected_provider_out, threads, config ? config->device_id : 0);
 
   free(encoder_path);
   free(decoder_path);
@@ -309,28 +523,36 @@ fail:
   return -1;
 }
 
-static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
+static int tdt_runtime_get(const char *model_dir, const SttConfig *config, TdtRuntime **runtime_out) {
   long long start_ms = stt_now_ms();
+  SttInferProvider requested_provider = parse_provider(requested_provider_name(config));
+  if (requested_provider == STT_INFER_PROVIDER_UNKNOWN) {
+    LOG_ERROR("infer: unknown provider=%s\n", requested_provider_name(config));
+    return -1;
+  }
   const char *variant = NULL;
   const char *encoder_file = NULL;
   const char *decoder_file = NULL;
-  tdt_variant_files(model_dir, &variant, &encoder_file, &decoder_file);
+  tdt_variant_files(model_dir, config, requested_provider, &variant, &encoder_file, &decoder_file);
 
   if (g_tdt_runtime.ready &&
       strcmp(g_tdt_runtime.model_dir, model_dir) == 0 &&
-      strcmp(g_tdt_runtime.variant, variant) == 0) {
+      strcmp(g_tdt_runtime.variant, variant) == 0 &&
+      strcmp(g_tdt_runtime.provider, requested_provider_name(config)) == 0) {
     LOG_TRACE("infer: runtime_cache hit=1 elapsed_ms=0\n");
     *runtime_out = &g_tdt_runtime;
     return 0;
   }
 
-  LOG_DEBUG("infer: runtime_cache hit=0 loading model_dir=%s variant=%s\n", model_dir, variant);
+  LOG_DEBUG("infer: runtime_cache hit=0 loading model_dir=%s variant=%s provider_request=%s\n",
+            model_dir, variant, requested_provider_name(config));
   tdt_runtime_free(&g_tdt_runtime);
   char *vocab_path = stt_path_join(model_dir, "vocab.txt");
   if (!vocab_path) return -1;
   g_tdt_runtime.model_dir = strdup(model_dir);
   g_tdt_runtime.variant = strdup(variant);
-  if (!g_tdt_runtime.model_dir || !g_tdt_runtime.variant) {
+  g_tdt_runtime.provider = strdup(requested_provider_name(config));
+  if (!g_tdt_runtime.model_dir || !g_tdt_runtime.variant || !g_tdt_runtime.provider) {
     free(vocab_path);
     tdt_runtime_free(&g_tdt_runtime);
     return -1;
@@ -341,13 +563,18 @@ static int tdt_runtime_get(const char *model_dir, TdtRuntime **runtime_out) {
     return -1;
   }
   free(vocab_path);
-  if (ort_tdt_init(&g_tdt_runtime.ort, model_dir, variant, encoder_file, decoder_file) != 0) {
+  const char *selected_provider = "cpu";
+  if (ort_tdt_init(&g_tdt_runtime.ort, config, model_dir, variant, encoder_file, decoder_file, &selected_provider) != 0) {
     tdt_runtime_free(&g_tdt_runtime);
     return -1;
   }
   g_tdt_runtime.ready = 1;
-  LOG_DEBUG("infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s\n",
-           stt_now_ms() - start_ms, g_tdt_runtime.vocab.count, g_tdt_runtime.variant);
+  LOG_DEBUG("infer: runtime_cache loaded elapsed_ms=%lld tokens=%zu variant=%s provider_request=%s provider_selected=%s\n",
+            stt_now_ms() - start_ms,
+            g_tdt_runtime.vocab.count,
+            g_tdt_runtime.variant,
+            g_tdt_runtime.provider,
+            selected_provider);
   *runtime_out = &g_tdt_runtime;
   return 0;
 }
@@ -519,7 +746,7 @@ fail:
   return -1;
 }
 
-static int transcribe_tdt_onnx(SttModel *model, const SttAudioBuffer *audio, char **text_out) {
+static int transcribe_tdt_onnx(SttModel *model, const SttAudioBuffer *audio, const SttConfig *config, char **text_out) {
   SttFeatures features;
   long long total_start_ms = stt_now_ms();
   double audio_sec = audio->sample_rate ? (double)audio->len / (double)audio->sample_rate : 0.0;
@@ -545,7 +772,7 @@ static int transcribe_tdt_onnx(SttModel *model, const SttAudioBuffer *audio, cha
   int rc = -1;
 
   long long runtime_start_ms = stt_now_ms();
-  if (tdt_runtime_get(stt_model_dir(model), &runtime) != 0) goto done;
+  if (tdt_runtime_get(stt_model_dir(model), config, &runtime) != 0) goto done;
   runtime_ms = stt_now_ms() - runtime_start_ms;
   if (encoder_run(&runtime->ort, &features, &encoded, &encoded_len, &encoder_ms) != 0) goto done;
   LOG_TRACE("infer: encoder elapsed_ms=%lld encoded_frames=%lld\n", encoder_ms, (long long)encoded_len);
@@ -662,20 +889,20 @@ static int tdt_runtime_prime(TdtRuntime *runtime) {
   return 0;
 }
 
-int stt_transcribe_warmup(SttModel *model) {
+int stt_transcribe_warmup(SttModel *model, const SttConfig *config) {
   long long start_ms = stt_now_ms();
   TdtRuntime *runtime = NULL;
-  int rc = tdt_runtime_get(stt_model_dir(model), &runtime);
+  int rc = tdt_runtime_get(stt_model_dir(model), config, &runtime);
   if (rc == 0) rc = tdt_runtime_prime(runtime);
   LOG_DEBUG("infer: warmup elapsed_ms=%lld rc=%d\n", stt_now_ms() - start_ms, rc);
   return rc;
 }
 
-int stt_transcribe(SttModel *model, const SttAudioBuffer *audio, char **text_out) {
+int stt_transcribe(SttModel *model, const SttAudioBuffer *audio, const SttConfig *config, char **text_out) {
   static unsigned long long transcribe_seq = 0;
   unsigned long long transcribe_id = ++transcribe_seq;
   double seconds = audio->sample_rate ? (double)audio->len / (double)audio->sample_rate : 0.0;
   LOG_TRACE("infer: start id=%llu audio_sec=%.2f samples=%zu sample_rate=%d channels=%d\n",
             transcribe_id, seconds, audio->len, audio->sample_rate, audio->channels);
-  return transcribe_tdt_onnx(model, audio, text_out);
+  return transcribe_tdt_onnx(model, audio, config, text_out);
 }

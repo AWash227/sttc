@@ -6,10 +6,14 @@
 typedef struct {
   const char *model_dir;
   const char *log_path;
+  const char *infer_provider;
+  const char *model_variant;
   int type_delay_ms;
   int max_audio_sec;
   int pre_roll_ms;
   int post_roll_ms;
+  int device_id;
+  int threads;
   int dry_run;
   int print_only;
 } SttConfig;

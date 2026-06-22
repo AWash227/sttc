@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
-#include "stt/hotkey.h"
 #include "stt/log.h"
+
+#include "backend.h"
 
 #include <errno.h>
 #include <fcntl.h>

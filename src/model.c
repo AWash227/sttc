@@ -7,7 +7,9 @@
 
 static const char *TDT_ONNX_FILES[] = {
   "encoder-model.onnx",
+  "encoder-model.onnx.data",
   "decoder_joint-model.onnx",
+  "config.json",
   "vocab.txt",
 };
 

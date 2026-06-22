@@ -2,15 +2,15 @@
 #include "stt/audio.h"
 #include "stt/log.h"
 
-#include <pulse/error.h>
-#include <pulse/simple.h>
+#include "backend.h"
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct SttRecorder {
-  pa_simple *pa;
+  SttAudioSource *source;
   pthread_t thread;
   pthread_mutex_t mutex;
   pthread_cond_t cond;
@@ -141,15 +141,14 @@ static void *record_thread(void *arg) {
   SttRecorder *rec = arg;
   int16_t chunk[256];
   while (!rec->stop_thread) {
-    int error = 0;
-    if (pa_simple_read(rec->pa, chunk, sizeof(chunk), &error) < 0) {
+    if (stt_audio_source_read(rec->source, chunk, sizeof(chunk) / sizeof(chunk[0])) != 0) {
       pthread_mutex_lock(&rec->mutex);
       rec->read_error = 1;
       rec->active = 0;
       rec->committing = 0;
       pthread_cond_broadcast(&rec->cond);
       pthread_mutex_unlock(&rec->mutex);
-      LOG_ERROR("PulseAudio read failed: %s\n", pa_strerror(error));
+      LOG_ERROR("%s read failed\n", stt_audio_backend_name());
       break;
     }
 
@@ -198,40 +197,25 @@ int stt_recorder_open(SttRecorder **out, const SttConfig *config) {
   pthread_mutex_init(&rec->mutex, NULL);
   pthread_cond_init(&rec->cond, NULL);
 
-  pa_sample_spec ss = {
-    .format = PA_SAMPLE_S16LE,
-    .rate = STT_SAMPLE_RATE,
-    .channels = 1,
-  };
-  pa_buffer_attr attr = {
-    .maxlength = (uint32_t)-1,
-    .tlength = (uint32_t)-1,
-    .prebuf = (uint32_t)-1,
-    .minreq = (uint32_t)-1,
-    .fragsize = 256 * sizeof(int16_t),
-  };
-  int error = 0;
-  rec->pa = pa_simple_new(NULL, "stt", PA_STREAM_RECORD, NULL, "dictation", &ss, NULL, &attr, &error);
-  if (!rec->pa) {
-    LOG_ERROR("PulseAudio open failed: %s\n", pa_strerror(error));
+  if (stt_audio_source_open(&rec->source, config, "dictation") != 0) {
     free(rec->pre);
     free(rec);
     return -1;
   }
   if (pthread_create(&rec->thread, NULL, record_thread, rec) != 0) {
-    pa_simple_free(rec->pa);
+    stt_audio_source_close(rec->source);
     free(rec->pre);
     free(rec);
     return -1;
   }
   rec->owns_thread = 1;
-  LOG_INFO("Microphone ready: %d Hz mono, %.2fs pre-roll, %.2fs post-roll, %.0fs segments\n",
+  LOG_INFO("Microphone ready: backend=%s %d Hz mono, %.2fs pre-roll, %.2fs post-roll, %.0fs segments\n",
+          stt_audio_backend_name(),
           STT_SAMPLE_RATE,
           rec->pre_roll_samples / (double)STT_SAMPLE_RATE,
           rec->post_roll_samples / (double)STT_SAMPLE_RATE,
           rec->max_samples / (double)STT_SAMPLE_RATE);
-  LOG_DEBUG("audio monitor ready: fragment %.3fs\n",
-          attr.fragsize / (double)(STT_SAMPLE_RATE * sizeof(int16_t)));
+  LOG_DEBUG("audio monitor ready: fragment %.3fs\n", 256.0 / (double)STT_SAMPLE_RATE);
   *out = rec;
   return 0;
 }
@@ -242,7 +226,7 @@ void stt_recorder_close(SttRecorder *rec) {
     rec->stop_thread = 1;
     pthread_join(rec->thread, NULL);
   }
-  if (rec->pa) pa_simple_free(rec->pa);
+  stt_audio_source_close(rec->source);
   pthread_mutex_destroy(&rec->mutex);
   pthread_cond_destroy(&rec->cond);
   stt_audio_buffer_free(&rec->capture);

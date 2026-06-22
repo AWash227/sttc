@@ -1,6 +1,6 @@
 # stt
 
-Small C dictation CLI targeting NVIDIA Parakeet TDT ONNX models on Linux.
+Small C dictation CLI targeting Parakeet TDT ONNX models through ONNX Runtime.
 
 ## Status
 
@@ -9,9 +9,10 @@ Implemented:
 - CLI command: `run`
 - TDT ONNX model directory contract under `~/.models/parakeet-tdt`
 - ONNX Runtime execution of TDT encoder and decoder/joint graphs
-- PulseAudio default microphone capture while `Super+V` is held
-- Linux input-device hotkey grabbing for `Super+V`
-- XTest ASCII typing with configurable per-character delay
+- Selectable ONNX Runtime provider request: CPU baseline, CUDA by default, and optional DirectML/CoreML/OpenVINO/MIGraphX/XNNPACK builds
+- Selectable audio backend: PulseAudio, PortAudio, or disabled/headless
+- Selectable hotkey backend: Linux input-device `Super+V` grabbing or disabled/headless
+- Selectable text backend: XTest ASCII typing or stdout/headless
 - TDT greedy decoding for logits shaped as token logits plus duration logits
 
 Not complete yet:
@@ -26,11 +27,45 @@ cmake -S . -B build
 cmake --build build
 ```
 
+Useful backend configurations:
+
+```sh
+# Default Linux desktop build: PulseAudio + Linux evdev/uinput hotkey + X11 typing.
+cmake -S . -B build
+
+# Headless CPU-oriented build with no PulseAudio, X11, or Linux input dependency.
+cmake -S . -B build-headless \
+  -DSTT_AUDIO_BACKEND=none \
+  -DSTT_HOTKEY_BACKEND=none \
+  -DSTT_TEXT_BACKEND=stdout \
+  -DSTT_ENABLE_CUDA=OFF
+
+# PortAudio capture with stdout output.
+cmake -S . -B build-portaudio \
+  -DSTT_AUDIO_BACKEND=portaudio \
+  -DSTT_HOTKEY_BACKEND=none \
+  -DSTT_TEXT_BACKEND=stdout
+```
+
+Provider toggles are CMake options: `STT_ENABLE_CUDA`, `STT_ENABLE_DIRECTML`, `STT_ENABLE_COREML`, `STT_ENABLE_OPENVINO`, `STT_ENABLE_MIGRAPHX`, and `STT_ENABLE_XNNPACK`.
+
 ## Usage
 
 ```sh
 ./build/stt run --dry-run
 ```
+
+Runtime inference controls:
+
+```sh
+./build/stt run --infer-provider auto
+./build/stt run --infer-provider cpu --threads 4
+./build/stt run --infer-provider cuda --device-id 0
+./build/stt run --model-variant fp32
+./build/stt run --model-variant int8
+```
+
+`auto` tries enabled providers in build order and falls back to CPU. An explicit non-CPU provider fails if it is not enabled or unavailable in the installed ONNX Runtime package. `fp32` is the portable model variant; `int8` is kept to CPU/CUDA paths until other providers are verified.
 
 With no subcommand, `stt` runs the dictation loop with the same defaults as `stt run`.
 Use `--log file.md` to also keep a continuous microphone transcription log, one utterance per line, while preserving the normal `Super+V` dictation behavior.

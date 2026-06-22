@@ -1,14 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stt/audio.h"
 #include "stt/cli.h"
-#include "stt/hotkey.h"
 #include "stt/infer.h"
 #include "stt/log.h"
 #include "stt/model.h"
-#include "stt/text_x11.h"
 
-#include <pulse/error.h>
-#include <pulse/simple.h>
+#include "audio/backend.h"
+#include "hotkey/backend.h"
+#include "text/backend.h"
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -244,28 +244,14 @@ static void enqueue_log_audio(AutoLogState *state, SttAudioBuffer *audio) {
 
 static void *auto_log_worker(void *arg) {
   AutoLogState *state = arg;
-  pa_sample_spec ss = {
-    .format = PA_SAMPLE_S16LE,
-    .rate = STT_SAMPLE_RATE,
-    .channels = 1,
-  };
-  pa_buffer_attr attr = {
-    .maxlength = (uint32_t)-1,
-    .tlength = (uint32_t)-1,
-    .prebuf = (uint32_t)-1,
-    .minreq = (uint32_t)-1,
-    .fragsize = 256 * sizeof(int16_t),
-  };
-  int error = 0;
-  pa_simple *pa = pa_simple_new(NULL, "stt", PA_STREAM_RECORD, NULL, "transcription log", &ss, NULL, &attr, &error);
-  if (!pa) {
-    LOG_ERROR("log: PulseAudio open failed: %s\n", pa_strerror(error));
+  SttAudioSource *source = NULL;
+  if (stt_audio_source_open(&source, state->config, "transcription log") != 0) {
     return NULL;
   }
 
   SampleRing pre;
   if (ring_init(&pre, (size_t)STT_SAMPLE_RATE * 350 / 1000) != 0) {
-    pa_simple_free(pa);
+    stt_audio_source_close(source);
     return NULL;
   }
 
@@ -281,9 +267,8 @@ static void *auto_log_worker(void *arg) {
 
   LOG_INFO("Continuous log enabled: %s\n", state->config->log_path);
   while (!atomic_load(&state->stop)) {
-    error = 0;
-    if (pa_simple_read(pa, chunk, sizeof(chunk), &error) < 0) {
-      LOG_ERROR("log: PulseAudio read failed: %s\n", pa_strerror(error));
+    if (stt_audio_source_read(source, chunk, sizeof(chunk) / sizeof(chunk[0])) != 0) {
+      LOG_ERROR("log: %s read failed\n", stt_audio_backend_name());
       break;
     }
 
@@ -334,7 +319,7 @@ static void *auto_log_worker(void *arg) {
   if (active && audio.len > 0) enqueue_log_audio(state, &audio);
   stt_audio_buffer_free(&audio);
   ring_free(&pre);
-  pa_simple_free(pa);
+  stt_audio_source_close(source);
   return NULL;
 }
 
@@ -387,7 +372,7 @@ static void *transcribe_worker(void *arg) {
 
     char *text = NULL;
     long long transcribe_start_ms = stt_now_ms();
-    int rc = stt_transcribe(queue->model, &job->audio, &text);
+    int rc = stt_transcribe(queue->model, &job->audio, queue->config, &text);
     long long transcribe_ms = stt_now_ms() - transcribe_start_ms;
     long long type_ms = 0;
     LOG_DEBUG("run: capture=%llu segment=%u/%u transcribe rc=%d elapsed_ms=%lld\n",
@@ -412,12 +397,12 @@ static void *transcribe_worker(void *arg) {
                     job->capture_id, job->segment_index + 1, job->segment_count, type_wait_ms);
         }
         long long type_start_ms = stt_now_ms();
-        int type_rc = stt_type_phrase_x11(text, queue->config->type_delay_ms);
+        int type_rc = stt_text_output_write(text, queue->config->type_delay_ms);
         type_ms = stt_now_ms() - type_start_ms;
         LOG_DEBUG("run: capture=%llu segment=%u/%u type elapsed_ms=%lld\n",
                   job->capture_id, job->segment_index + 1, job->segment_count, type_ms);
         if (type_rc == 0) {
-          LOG_INFO("Typed: %s\n", text);
+          LOG_INFO("%s: %s\n", strcmp(stt_text_backend_name(), "stdout") == 0 ? "Printed" : "Typed", text);
         } else {
           LOG_WARN("Could not type the transcript; try --print to copy it manually.\n");
         }
@@ -629,7 +614,7 @@ int main(int argc, char **argv) {
   }
   long long warmup_start_ms = stt_now_ms();
   LOG_INFO("Warming up speech model...\n");
-  int warmup_rc = stt_transcribe_warmup(model);
+  int warmup_rc = stt_transcribe_warmup(model, &config);
   LOG_DEBUG("run: warmup rc=%d elapsed_ms=%lld\n", warmup_rc, stt_now_ms() - warmup_start_ms);
   if (warmup_rc != 0) {
     stt_recorder_close(recorder);
