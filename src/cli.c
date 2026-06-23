@@ -7,7 +7,6 @@
 
 static void config_defaults(SttConfig *config) {
   memset(config, 0, sizeof(*config));
-  config->model_dir = "~/.models/parakeet-tdt";
   config->infer_provider = "auto";
   config->model_variant = "auto";
   config->type_delay_ms = 0;

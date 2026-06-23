@@ -2,24 +2,42 @@
 #include "stt/fs.h"
 
 #include <errno.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#else
 #include <pwd.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#define STT_PATH_SEP '\\'
+#define stt_mkdir_one(path) _mkdir(path)
+#else
+#define STT_PATH_SEP '/'
+#define stt_mkdir_one(path) mkdir(path, 0755)
+#endif
 
 char *stt_expand_home(const char *path) {
   if (!path) return NULL;
   if (path[0] != '~') return strdup(path);
   if (path[1] != '/' && path[1] != '\0') return strdup(path);
 
+#ifdef _WIN32
+  const char *home = getenv("USERPROFILE");
+  if (!home) home = getenv("HOME");
+#else
   const char *home = getenv("HOME");
   if (!home) {
     struct passwd *pw = getpwuid(getuid());
     if (pw) home = pw->pw_dir;
   }
+#endif
   if (!home) return NULL;
 
   size_t home_len = strlen(home);
@@ -34,11 +52,11 @@ char *stt_expand_home(const char *path) {
 char *stt_path_join(const char *a, const char *b) {
   size_t alen = strlen(a);
   size_t blen = strlen(b);
-  int slash = alen > 0 && a[alen - 1] == '/';
+  int slash = alen > 0 && (a[alen - 1] == '/' || a[alen - 1] == '\\');
   char *out = malloc(alen + blen + (slash ? 1 : 2));
   if (!out) return NULL;
   memcpy(out, a, alen);
-  if (!slash) out[alen++] = '/';
+  if (!slash) out[alen++] = STT_PATH_SEP;
   memcpy(out + alen, b, blen + 1);
   return out;
 }
@@ -47,16 +65,21 @@ int stt_mkdir_p(const char *path) {
   char *tmp = strdup(path);
   if (!tmp) return -1;
   for (char *p = tmp + 1; *p; ++p) {
-    if (*p == '/') {
+    if (*p == ':' && p[1] == '\\') {
+      p++;
+      continue;
+    }
+    if (*p == '/' || *p == '\\') {
+      char saved = *p;
       *p = '\0';
-      if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+      if (stt_mkdir_one(tmp) != 0 && errno != EEXIST) {
         free(tmp);
         return -1;
       }
-      *p = '/';
+      *p = saved;
     }
   }
-  if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+  if (stt_mkdir_one(tmp) != 0 && errno != EEXIST) {
     free(tmp);
     return -1;
   }
@@ -66,7 +89,11 @@ int stt_mkdir_p(const char *path) {
 
 int stt_file_exists(const char *path) {
   struct stat st;
+#ifdef _WIN32
+  return stat(path, &st) == 0 && (st.st_mode & _S_IFREG);
+#else
   return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+#endif
 }
 
 char *stt_read_file(const char *path, size_t *len_out) {
@@ -96,4 +123,13 @@ char *stt_read_file(const char *path, size_t *len_out) {
   buf[got] = '\0';
   if (len_out) *len_out = got;
   return buf;
+}
+
+int stt_write_file(const char *path, const char *text) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return -1;
+  size_t len = strlen(text);
+  size_t wrote = fwrite(text, 1, len, f);
+  int rc = fclose(f);
+  return wrote == len && rc == 0 ? 0 : -1;
 }

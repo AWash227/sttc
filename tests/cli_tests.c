@@ -7,7 +7,7 @@ static void test_defaults(void) {
   char *argv[] = {"stt"};
   SttConfig config;
   assert(stt_parse_args(1, argv, &config) == 0);
-  assert(strcmp(config.model_dir, "~/.models/parakeet-tdt") == 0);
+  assert(config.model_dir == NULL);
   assert(strcmp(config.infer_provider, "auto") == 0);
   assert(strcmp(config.model_variant, "auto") == 0);
   assert(config.device_id == 0);

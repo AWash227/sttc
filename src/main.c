@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "stt/app.h"
 #include "stt/audio.h"
 #include "stt/cli.h"
 #include "stt/infer.h"
@@ -604,6 +605,7 @@ int main(int argc, char **argv) {
     stt_print_usage(argv[0]);
     return 2;
   }
+  if (stt_app_prepare(&config) != 0) return 1;
 
   SttModel *model = NULL;
   if (stt_model_load(&model, config.model_dir) != 0) return 1;

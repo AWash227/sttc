@@ -8,5 +8,6 @@ char *stt_path_join(const char *a, const char *b);
 int stt_mkdir_p(const char *path);
 int stt_file_exists(const char *path);
 char *stt_read_file(const char *path, size_t *len_out);
+int stt_write_file(const char *path, const char *text);
 
 #endif

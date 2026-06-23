@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "linux-x86-64",
+      "displayName": "linux-x86-64",
+      "binaryDir": "${sourceDir}/build/linux-x86-64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "STT_ENABLE_CUDA": "ON",
+        "STT_ENABLE_DOWNLOAD": "ON"
+      }
+    },
+    {
+      "name": "windows-x86-64",
+      "displayName": "windows-x86-64",
+      "binaryDir": "${sourceDir}/build/windows-x86-64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-x86_64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "STT_ENABLE_ORT": "OFF",
+        "STT_ENABLE_CUDA": "OFF",
+        "STT_ENABLE_DIRECTML": "ON",
+        "STT_ENABLE_DOWNLOAD": "OFF",
+        "STT_AUDIO_BACKEND": "none",
+        "STT_HOTKEY_BACKEND": "win32",
+        "STT_TEXT_BACKEND": "win32"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "linux-x86-64", "configurePreset": "linux-x86-64"},
+    {"name": "windows-x86-64", "configurePreset": "windows-x86-64"}
+  ],
+  "testPresets": [
+    {"name": "linux-x86-64", "configurePreset": "linux-x86-64", "output": {"outputOnFailure": true}}
+  ]
+}
