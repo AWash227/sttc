@@ -15,14 +15,15 @@
       "name": "windows-x86-64",
       "displayName": "windows-x86-64",
       "binaryDir": "${sourceDir}/build/windows-x86-64",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-x86_64.cmake",
+      "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "STT_ENABLE_ORT": "OFF",
+        "STT_ENABLE_ORT": "ON",
         "STT_ENABLE_CUDA": "OFF",
         "STT_ENABLE_DIRECTML": "ON",
-        "STT_ENABLE_DOWNLOAD": "OFF",
-        "STT_AUDIO_BACKEND": "none",
+        "STT_ENABLE_DOWNLOAD": "ON",
+        "STT_ORT_ROOT": "${sourceDir}/build/deps/onnxruntime-win-x64-1.27.0",
+        "STT_AUDIO_BACKEND": "portaudio",
         "STT_HOTKEY_BACKEND": "win32",
         "STT_TEXT_BACKEND": "win32"
       }
@@ -33,6 +34,7 @@
     {"name": "windows-x86-64", "configurePreset": "windows-x86-64"}
   ],
   "testPresets": [
-    {"name": "linux-x86-64", "configurePreset": "linux-x86-64", "output": {"outputOnFailure": true}}
+    {"name": "linux-x86-64", "configurePreset": "linux-x86-64", "output": {"outputOnFailure": true}},
+    {"name": "windows-x86-64", "configurePreset": "windows-x86-64", "output": {"outputOnFailure": true}}
   ]
 }

@@ -9,7 +9,7 @@ Implemented:
 - Default command starts the dictation loop.
 - First-run setup creates config/model directories, writes config if missing, checks model files, and prompts before download.
 - Linux x86-64 build: PulseAudio capture, `Meta+V`, X11 typing, ONNX Runtime inference.
-- Windows x86-64 build: `Alt+V`, Win32 text paste, bundled MinGW runtime DLLs.
+- Windows x86-64 build: PortAudio capture, `Ctrl+Shift`, Win32 text typing, ONNX Runtime inference, first-run download, bundled runtime DLLs.
 - Runtime provider preference: `auto`, `cpu`, `cuda`, `directml`, `coreml`, `openvino`, `migraphx`, `xnnpack`.
 - TDT greedy decoding for token logits plus duration logits.
 
@@ -17,7 +17,6 @@ Not complete yet:
 
 - Feature extraction parity tests against Hugging Face `processor_config.json`.
 - Full UTF-8 text injection through X11 clipboard ownership.
-- Windows release currently builds with inference/download disabled until Windows ONNX Runtime and model-download packaging are bundled.
 - The official Hugging Face ONNX repo id still needs final confirmation; the current downloader constant is isolated in `src/app.c`.
 
 ## Build
@@ -30,11 +29,20 @@ cmake --build --preset linux-x86-64
 ctest --preset linux-x86-64
 ```
 
-Windows cross-build:
+Windows native build with MSYS2 MinGW64:
+
+Install MSYS2, open the "MSYS2 MinGW x64" shell, then install build dependencies:
+
+```sh
+pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf mingw-w64-x86_64-portaudio mingw-w64-x86_64-fftw
+```
+
+The Windows preset expects the ONNX Runtime package at `build/deps/onnxruntime-win-x64-1.27.0`. If it is in another location, pass `-DSTT_ORT_ROOT=/path/to/onnxruntime-win-x64-1.27.0`.
 
 ```sh
 cmake --preset windows-x86-64
 cmake --build --preset windows-x86-64
+ctest --preset windows-x86-64
 ```
 
 Release artifact names should be:
@@ -81,7 +89,7 @@ On Linux, `stt` grabs `/dev/input/by-id/*-event-kbd` and creates a `/dev/uinput`
 STT_KEYBOARD_DEVICE=/dev/input/by-id/YOUR_KEYBOARD-event-kbd ./build/linux-x86-64/stt --dry-run
 ```
 
-On Windows, the default hotkey is `Alt+V`.
+On Windows, the default hotkey is `Ctrl+Shift`.
 
 Logs default to `info`. Use `STT_LOG_LEVEL` for quieter output or deeper tracing:
 

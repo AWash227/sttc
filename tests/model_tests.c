@@ -5,7 +5,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#define stt_rmdir _rmdir
+#define stt_unlink _unlink
+#else
 #include <unistd.h>
+#define stt_rmdir rmdir
+#define stt_unlink unlink
+#endif
 
 static void touch_file(const char *dir, const char *name) {
   char path[512];
@@ -26,14 +37,32 @@ static void remove_bundle(const char *dir) {
   char path[512];
   for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
     snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
-    unlink(path);
+    stt_unlink(path);
   }
-  rmdir(dir);
+  stt_rmdir(dir);
+}
+
+static char *make_temp_dir(void) {
+#ifdef _WIN32
+  const char *base = getenv("TEMP");
+  if (!base || !*base) base = getenv("TMP");
+  if (!base || !*base) base = ".";
+  char path[512];
+  for (int i = 0; i < 100; ++i) {
+    snprintf(path, sizeof(path), "%s\\stt-model-test-%lu-%d", base, (unsigned long)GetCurrentProcessId(), i);
+    if (_mkdir(path) == 0) return strdup(path);
+  }
+  return NULL;
+#else
+  char tmpl[] = "/tmp/stt-model-test-XXXXXX";
+  char *dir = mkdtemp(tmpl);
+  return dir ? strdup(dir) : NULL;
+#endif
 }
 
 static void test_requires_full_bundle(void) {
-  char dir[] = "/tmp/stt-model-test-XXXXXX";
-  assert(mkdtemp(dir));
+  char *dir = make_temp_dir();
+  assert(dir);
 
   SttModel *model = NULL;
   assert(stt_model_load(&model, dir) != 0);
@@ -48,6 +77,7 @@ static void test_requires_full_bundle(void) {
   stt_model_free(model);
 
   remove_bundle(dir);
+  free(dir);
 }
 
 int main(void) {

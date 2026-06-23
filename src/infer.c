@@ -11,18 +11,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #define TDT_FEATURE_BINS 128
 #define TDT_ENCODER_DIM 1024
 #define TDT_STATE_LAYERS 2
 #define TDT_STATE_DIM 640
-#define TDT_VOCAB_SIZE 1025
 #define TDT_DURATION_COUNT 5
-#define TDT_BLANK_ID 1024
 #define TDT_MAX_TOKENS_PER_STEP 10
 
 typedef struct {
   char **tokens;
   size_t count;
+  int blank_id;
 } TdtVocab;
 
 typedef struct {
@@ -390,6 +393,7 @@ static void tdt_vocab_free(TdtVocab *vocab) {
 
 static int tdt_vocab_load(TdtVocab *vocab, const char *path) {
   memset(vocab, 0, sizeof(*vocab));
+  vocab->blank_id = -1;
   size_t len = 0;
   char *text = stt_read_file(path, &len);
   if (!text) {
@@ -397,12 +401,12 @@ static int tdt_vocab_load(TdtVocab *vocab, const char *path) {
     return -1;
   }
 
-  vocab->tokens = calloc(TDT_VOCAB_SIZE, sizeof(*vocab->tokens));
+  size_t cap = 1024;
+  vocab->tokens = calloc(cap, sizeof(*vocab->tokens));
   if (!vocab->tokens) {
     free(text);
     return -1;
   }
-  vocab->count = TDT_VOCAB_SIZE;
 
   char *save = NULL;
   for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -411,18 +415,38 @@ static int tdt_vocab_load(TdtVocab *vocab, const char *path) {
     *sep++ = '\0';
     char *end = NULL;
     long id = strtol(sep, &end, 10);
-    if (*line && id >= 0 && id < TDT_VOCAB_SIZE && end && *end == '\0') {
+    if (*line && id >= 0 && end && (*end == '\0' || *end == '\r')) {
+      size_t token_id = (size_t)id;
+      if (token_id >= cap) {
+        size_t next_cap = cap;
+        while (token_id >= next_cap) next_cap *= 2;
+        char **next = realloc(vocab->tokens, next_cap * sizeof(*next));
+        if (!next) {
+          free(text);
+          tdt_vocab_free(vocab);
+          return -1;
+        }
+        memset(next + cap, 0, (next_cap - cap) * sizeof(*next));
+        vocab->tokens = next;
+        cap = next_cap;
+      }
       vocab->tokens[id] = strdup(line);
       if (!vocab->tokens[id]) {
         free(text);
         tdt_vocab_free(vocab);
         return -1;
       }
+      if (strcmp(line, "<blk>") == 0) vocab->blank_id = (int)id;
+      if (token_id + 1 > vocab->count) vocab->count = token_id + 1;
     }
   }
 
   free(text);
-  return vocab->tokens[TDT_BLANK_ID] ? 0 : -1;
+  if (vocab->blank_id < 0 || (size_t)vocab->blank_id >= vocab->count || !vocab->tokens[vocab->blank_id]) {
+    tdt_vocab_free(vocab);
+    return -1;
+  }
+  return 0;
 }
 
 static int tdt_vocab_decode(const TdtVocab *vocab, const int *ids, size_t id_count, char **text_out) {
@@ -485,6 +509,20 @@ static void tdt_runtime_free(TdtRuntime *runtime) {
   memset(runtime, 0, sizeof(*runtime));
 }
 
+#ifdef _WIN32
+static wchar_t *utf8_to_wide(const char *path) {
+  int needed = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+  if (needed <= 0) return NULL;
+  wchar_t *wide = malloc((size_t)needed * sizeof(*wide));
+  if (!wide) return NULL;
+  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, needed) <= 0) {
+    free(wide);
+    return NULL;
+  }
+  return wide;
+}
+#endif
+
 static int ort_tdt_init(OrtTdt *ort,
                         const SttConfig *config,
                         const char *model_dir,
@@ -497,7 +535,16 @@ static int ort_tdt_init(OrtTdt *ort,
   ort->api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
   char *encoder_path = stt_path_join(model_dir, encoder_file);
   char *decoder_path = stt_path_join(model_dir, decoder_file);
+#ifdef _WIN32
+  wchar_t *encoder_path_w = NULL;
+  wchar_t *decoder_path_w = NULL;
+#endif
   if (!encoder_path || !decoder_path) goto fail;
+#ifdef _WIN32
+  encoder_path_w = utf8_to_wide(encoder_path);
+  decoder_path_w = utf8_to_wide(decoder_path);
+  if (!encoder_path_w || !decoder_path_w) goto fail;
+#endif
   LOG_DEBUG("infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
 
   if (ort_check(ort, ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "stt", &ort->env), "CreateEnv") != 0) goto fail;
@@ -506,19 +553,32 @@ static int ort_tdt_init(OrtTdt *ort,
   ort_check(ort, ort->api->SetIntraOpNumThreads(ort->options, threads), "SetIntraOpNumThreads");
   ort_check(ort, ort->api->SetSessionGraphOptimizationLevel(ort->options, ORT_ENABLE_ALL), "SetSessionGraphOptimizationLevel");
   if (configure_providers(ort, config, selected_provider_out) != 0) goto fail;
+#ifdef _WIN32
+  if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path_w, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
+  if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path_w, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
+#else
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
   if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
+#endif
   if (ort_check(ort, ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->memory), "CreateCpuMemoryInfo") != 0) goto fail;
   LOG_DEBUG("infer: ort_init done elapsed_ms=%lld provider=%s threads=%d device_id=%d\n",
             stt_now_ms() - start_ms, *selected_provider_out, threads, config ? config->device_id : 0);
 
   free(encoder_path);
   free(decoder_path);
+#ifdef _WIN32
+  free(encoder_path_w);
+  free(decoder_path_w);
+#endif
   return 0;
 
 fail:
   free(encoder_path);
   free(decoder_path);
+#ifdef _WIN32
+  free(encoder_path_w);
+  free(decoder_path_w);
+#endif
   ort_tdt_free(ort);
   return -1;
 }
@@ -640,6 +700,7 @@ static int decoder_step(OrtTdt *ort,
                         const float *encoder,
                         int64_t encoded_len,
                         int64_t frame,
+                        const TdtVocab *vocab,
                         int32_t target,
                         const float *state1,
                         const float *state2,
@@ -670,9 +731,9 @@ static int decoder_step(OrtTdt *ort,
 
   float *logits = NULL;
   if (get_tensor_data(ort, outputs[0], &logits) != 0) goto done;
-  int token = argmax(logits, TDT_VOCAB_SIZE);
-  int duration = argmax(logits + TDT_VOCAB_SIZE, TDT_DURATION_COUNT);
-  if (token != TDT_BLANK_ID) {
+  int token = argmax(logits, vocab->count);
+  int duration = argmax(logits + vocab->count, TDT_DURATION_COUNT);
+  if (token != vocab->blank_id) {
     float *out_state1 = NULL;
     float *out_state2 = NULL;
     if (get_tensor_data(ort, outputs[2], &out_state1) != 0) goto done;
@@ -693,7 +754,7 @@ done:
   return rc;
 }
 
-static int tdt_greedy_decode_onnx(OrtTdt *ort, OrtValue *encoded_value, int64_t encoded_len, int **ids_out, size_t *id_count_out, DecodeStats *stats) {
+static int tdt_greedy_decode_onnx(OrtTdt *ort, const TdtVocab *vocab, OrtValue *encoded_value, int64_t encoded_len, int **ids_out, size_t *id_count_out, DecodeStats *stats) {
   float *encoder = NULL;
   if (get_tensor_data(ort, encoded_value, &encoder) != 0) return -1;
 
@@ -704,19 +765,19 @@ static int tdt_greedy_decode_onnx(OrtTdt *ort, OrtValue *encoded_value, int64_t 
   int *ids = NULL;
   size_t id_count = 0;
   size_t id_cap = 0;
-  int32_t target = TDT_BLANK_ID;
+  int32_t target = vocab->blank_id;
   int emitted_tokens = 0;
   memset(stats, 0, sizeof(*stats));
 
   for (int64_t t = 0; t < encoded_len;) {
-    int token = TDT_BLANK_ID;
+    int token = vocab->blank_id;
     int duration = 0;
     long long step_start_ms = stt_now_ms();
-    if (decoder_step(ort, encoder, encoded_len, t, target, state1, state2, next_state1, next_state2, &token, &duration) != 0) goto fail;
+    if (decoder_step(ort, encoder, encoded_len, t, vocab, target, state1, state2, next_state1, next_state2, &token, &duration) != 0) goto fail;
     stats->decoder_ms += stt_now_ms() - step_start_ms;
     stats->decoder_calls++;
 
-    if (token != TDT_BLANK_ID) {
+    if (token != vocab->blank_id) {
       if (push_id(&ids, &id_count, &id_cap, token) != 0) goto fail;
       stats->emitted_tokens++;
       memcpy(state1, next_state1, sizeof(state1));
@@ -725,14 +786,14 @@ static int tdt_greedy_decode_onnx(OrtTdt *ort, OrtValue *encoded_value, int64_t 
       emitted_tokens++;
     }
 
-    if (token != TDT_BLANK_ID && duration > 0) {
+    if (duration > 0) {
       t += duration;
       stats->advanced_frames += duration;
       emitted_tokens = 0;
-    } else if (token == TDT_BLANK_ID || emitted_tokens == TDT_MAX_TOKENS_PER_STEP) {
+    } else if (token == vocab->blank_id || emitted_tokens == TDT_MAX_TOKENS_PER_STEP) {
       t++;
       stats->advanced_frames++;
-      if (token == TDT_BLANK_ID) stats->blank_steps++;
+      if (token == vocab->blank_id) stats->blank_steps++;
       emitted_tokens = 0;
     }
   }
@@ -776,7 +837,7 @@ static int transcribe_tdt_onnx(SttModel *model, const SttAudioBuffer *audio, con
   runtime_ms = stt_now_ms() - runtime_start_ms;
   if (encoder_run(&runtime->ort, &features, &encoded, &encoded_len, &encoder_ms) != 0) goto done;
   LOG_TRACE("infer: encoder elapsed_ms=%lld encoded_frames=%lld\n", encoder_ms, (long long)encoded_len);
-  if (tdt_greedy_decode_onnx(&runtime->ort, encoded, encoded_len, &ids, &id_count, &decode_stats) != 0) goto done;
+  if (tdt_greedy_decode_onnx(&runtime->ort, &runtime->vocab, encoded, encoded_len, &ids, &id_count, &decode_stats) != 0) goto done;
   LOG_TRACE("infer: decoder elapsed_ms=%lld calls=%lld blank_steps=%lld emitted_tokens=%lld advanced_frames=%lld output_ids=%zu\n",
             decode_stats.decoder_ms,
             (long long)decode_stats.decoder_calls,
@@ -832,68 +893,10 @@ done:
   return rc;
 }
 
-static int tdt_runtime_prime_duration(TdtRuntime *runtime, int audio_sec) {
-  const int sample_rate = 16000;
-  const size_t sample_count = (size_t)sample_rate * (size_t)audio_sec;
-  int16_t *samples = calloc(sample_count, sizeof(*samples));
-  if (!samples) return -1;
-
-  SttAudioBuffer audio = {
-    .samples = samples,
-    .len = sample_count,
-    .cap = sample_count,
-    .sample_rate = sample_rate,
-    .channels = 1,
-  };
-  SttFeatures features;
-  OrtValue *encoded = NULL;
-  int *ids = NULL;
-  size_t id_count = 0;
-  int64_t encoded_len = 0;
-  long long encoder_ms = 0;
-  DecodeStats decode_stats = {0};
-  int rc = -1;
-
-  long long start_ms = stt_now_ms();
-  long long feature_start_ms = stt_now_ms();
-  if (stt_extract_features(&audio, &features) != 0) goto done_free_audio;
-  long long feature_ms = stt_now_ms() - feature_start_ms;
-  if (encoder_run(&runtime->ort, &features, &encoded, &encoded_len, &encoder_ms) != 0) goto done;
-  if (tdt_greedy_decode_onnx(&runtime->ort, encoded, encoded_len, &ids, &id_count, &decode_stats) != 0) goto done;
-  rc = 0;
-
-done:
-  free(ids);
-  if (encoded) runtime->ort.api->ReleaseValue(encoded);
-  stt_features_free(&features);
-  LOG_DEBUG("infer: warmup_prime audio_sec=%d elapsed_ms=%lld features_ms=%lld encoder_ms=%lld decoder_ms=%lld decoder_calls=%lld output_ids=%zu rc=%d\n",
-            audio_sec,
-           stt_now_ms() - start_ms,
-           rc == 0 ? feature_ms : 0,
-           encoder_ms,
-           decode_stats.decoder_ms,
-           (long long)decode_stats.decoder_calls,
-           id_count,
-           rc);
-done_free_audio:
-  free(samples);
-  return rc;
-}
-
-static int tdt_runtime_prime(TdtRuntime *runtime) {
-  static const int durations[] = {1, 2, 4, 8};
-  for (size_t i = 0; i < sizeof(durations) / sizeof(durations[0]); ++i) {
-    int rc = tdt_runtime_prime_duration(runtime, durations[i]);
-    if (rc != 0) return rc;
-  }
-  return 0;
-}
-
 int stt_transcribe_warmup(SttModel *model, const SttConfig *config) {
   long long start_ms = stt_now_ms();
   TdtRuntime *runtime = NULL;
   int rc = tdt_runtime_get(stt_model_dir(model), config, &runtime);
-  if (rc == 0) rc = tdt_runtime_prime(runtime);
   LOG_DEBUG("infer: warmup elapsed_ms=%lld rc=%d\n", stt_now_ms() - start_ms, rc);
   return rc;
 }

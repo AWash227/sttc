@@ -27,6 +27,7 @@ typedef struct SttAudioSegment {
 } SttAudioSegment;
 
 typedef struct SttRecorder SttRecorder;
+typedef void (*SttAudioMonitor)(const int16_t *samples, size_t sample_count, void *user);
 
 void stt_audio_buffer_init(SttAudioBuffer *buf);
 void stt_audio_buffer_free(SttAudioBuffer *buf);
@@ -34,6 +35,7 @@ void stt_audio_segments_free(SttAudioSegment *segment);
 
 int stt_recorder_open(SttRecorder **out, const SttConfig *config);
 void stt_recorder_close(SttRecorder *rec);
+void stt_recorder_set_monitor(SttRecorder *rec, SttAudioMonitor monitor, void *user);
 int stt_recorder_begin(SttRecorder *rec);
 int stt_recorder_commit_segments(SttRecorder *rec, SttAudioSegment **out);
 

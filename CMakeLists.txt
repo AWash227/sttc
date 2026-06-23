@@ -13,6 +13,7 @@ option(STT_ENABLE_OPENVINO "Enable ONNX Runtime OpenVINO provider selection" OFF
 option(STT_ENABLE_MIGRAPHX "Enable ONNX Runtime MIGraphX provider selection" OFF)
 option(STT_ENABLE_XNNPACK "Enable ONNX Runtime XNNPACK provider selection" OFF)
 option(STT_ENABLE_DOWNLOAD "Enable first-run Hugging Face model download" ON)
+set(STT_ORT_ROOT "" CACHE PATH "Path to an ONNX Runtime binary package")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(STT_DEFAULT_AUDIO_BACKEND "pulse")
@@ -77,15 +78,29 @@ function(stt_add_pkg pkg)
   set(STT_DEPS_LIBRARIES "${STT_DEPS_LIBRARIES}" PARENT_SCOPE)
 endfunction()
 
+function(stt_enable_warnings target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endfunction()
+
 if(STT_ENABLE_ORT)
   stt_add_pkg(fftw3f)
-  stt_add_pkg(libonnxruntime)
+  if(STT_ORT_ROOT)
+    list(APPEND STT_DEPS_INCLUDE_DIRS "${STT_ORT_ROOT}/include")
+    list(APPEND STT_DEPS_LIBRARY_DIRS "${STT_ORT_ROOT}/lib")
+    list(APPEND STT_DEPS_LIBRARIES onnxruntime)
+  else()
+    stt_add_pkg(libonnxruntime)
+  endif()
   list(APPEND STT_SOURCES src/features.c src/infer.c)
 else()
   list(APPEND STT_SOURCES src/infer_stub.c)
 endif()
 
-if(STT_ENABLE_DOWNLOAD)
+if(STT_ENABLE_DOWNLOAD AND NOT WIN32)
   stt_add_pkg(libcurl)
 endif()
 
@@ -136,7 +151,8 @@ add_executable(stt ${STT_SOURCES})
 
 target_include_directories(stt PRIVATE include)
 target_include_directories(stt SYSTEM PRIVATE ${STT_DEPS_INCLUDE_DIRS})
-target_compile_options(stt PRIVATE -Wall -Wextra -Wpedantic ${STT_DEPS_CFLAGS_OTHER})
+stt_enable_warnings(stt)
+target_compile_options(stt PRIVATE ${STT_DEPS_CFLAGS_OTHER})
 target_compile_definitions(stt PRIVATE
   STT_ENABLE_ORT=$<BOOL:${STT_ENABLE_ORT}>
   STT_ENABLE_DOWNLOAD=$<BOOL:${STT_ENABLE_DOWNLOAD}>
@@ -148,9 +164,44 @@ target_compile_definitions(stt PRIVATE
   STT_ENABLE_XNNPACK=$<BOOL:${STT_ENABLE_XNNPACK}>
 )
 target_link_directories(stt PRIVATE ${STT_DEPS_LIBRARY_DIRS})
-target_link_libraries(stt PRIVATE ${STT_DEPS_LIBRARIES} m Threads::Threads)
+target_link_libraries(stt PRIVATE ${STT_DEPS_LIBRARIES} Threads::Threads)
+if(NOT MSVC)
+  target_link_libraries(stt PRIVATE m)
+endif()
 if(WIN32)
   target_link_libraries(stt PRIVATE shell32 ole32 user32)
+  if(STT_ENABLE_DOWNLOAD)
+    target_link_libraries(stt PRIVATE winhttp)
+  endif()
+  if(STT_AUDIO_BACKEND STREQUAL "portaudio")
+    find_file(STT_PORTAUDIO_DLL libportaudio.dll
+      PATHS "${STT_MINGW_BIN_DIR}"
+      NO_DEFAULT_PATH)
+    if(STT_PORTAUDIO_DLL)
+      add_custom_command(TARGET stt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${STT_PORTAUDIO_DLL}"
+          "$<TARGET_FILE_DIR:stt>/libportaudio.dll")
+    endif()
+  endif()
+  find_file(STT_FFTW_DLL libfftw3f-3.dll
+    PATHS "${STT_MINGW_BIN_DIR}"
+    NO_DEFAULT_PATH)
+  if(STT_FFTW_DLL)
+    add_custom_command(TARGET stt POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${STT_FFTW_DLL}"
+        "$<TARGET_FILE_DIR:stt>/libfftw3f-3.dll")
+  endif()
+  if(STT_ORT_ROOT)
+    add_custom_command(TARGET stt POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${STT_ORT_ROOT}/lib/onnxruntime.dll"
+        "$<TARGET_FILE_DIR:stt>/onnxruntime.dll"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${STT_ORT_ROOT}/lib/onnxruntime_providers_shared.dll"
+        "$<TARGET_FILE_DIR:stt>/onnxruntime_providers_shared.dll")
+  endif()
 endif()
 
 include(CTest)
@@ -158,31 +209,31 @@ if(BUILD_TESTING)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(hotkey_tests tests/hotkey_tests.c src/log.c)
     target_include_directories(hotkey_tests PRIVATE include)
-    target_compile_options(hotkey_tests PRIVATE -Wall -Wextra -Wpedantic)
+    stt_enable_warnings(hotkey_tests)
     add_test(NAME hotkey_tests COMMAND hotkey_tests)
   endif()
 
   add_executable(audio_tests tests/audio_tests.c src/audio/recorder.c src/audio/none.c src/log.c)
   target_compile_definitions(audio_tests PRIVATE STT_TESTING)
   target_include_directories(audio_tests PRIVATE include)
-  target_compile_options(audio_tests PRIVATE -Wall -Wextra -Wpedantic)
+  stt_enable_warnings(audio_tests)
   target_link_libraries(audio_tests PRIVATE Threads::Threads)
   add_test(NAME audio_tests COMMAND audio_tests)
 
   add_executable(cli_tests tests/cli_tests.c src/cli.c)
   target_include_directories(cli_tests PRIVATE include)
-  target_compile_options(cli_tests PRIVATE -Wall -Wextra -Wpedantic)
+  stt_enable_warnings(cli_tests)
   add_test(NAME cli_tests COMMAND cli_tests)
 
   add_executable(model_tests tests/model_tests.c src/model.c src/fs.c src/log.c)
   target_include_directories(model_tests PRIVATE include)
-  target_compile_options(model_tests PRIVATE -Wall -Wextra -Wpedantic)
+  stt_enable_warnings(model_tests)
   add_test(NAME model_tests COMMAND model_tests)
 
   add_executable(app_tests tests/app_tests.c src/app.c src/fs.c src/log.c)
   target_compile_definitions(app_tests PRIVATE STT_ENABLE_DOWNLOAD=0)
   target_include_directories(app_tests PRIVATE include)
-  target_compile_options(app_tests PRIVATE -Wall -Wextra -Wpedantic)
+  stt_enable_warnings(app_tests)
   if(WIN32)
     target_link_libraries(app_tests PRIVATE shell32 ole32)
   endif()

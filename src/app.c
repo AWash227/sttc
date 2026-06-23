@@ -11,9 +11,12 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#if STT_ENABLE_DOWNLOAD
+#include <winhttp.h>
+#endif
 #endif
 
-#if STT_ENABLE_DOWNLOAD
+#if STT_ENABLE_DOWNLOAD && !defined(_WIN32)
 #include <curl/curl.h>
 #endif
 
@@ -21,10 +24,10 @@ typedef struct {
   const char *name;
 } ModelFile;
 
+static const char *MODEL_REVISION = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce";
 #if STT_ENABLE_DOWNLOAD
-static const char *MODEL_REPO = "onnx-asr/nemo-parakeet-tdt-0.6b-v2";
+static const char *MODEL_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 #endif
-static const char *MODEL_REVISION = "d808c3be882f47cf6a15a42c0eb9ee751b99a379";
 static const ModelFile MODEL_FILES[] = {
   {"encoder-model.onnx"},
   {"encoder-model.onnx.data"},
@@ -99,7 +102,7 @@ static char *config_path_from_dir(const char *dir) {
 
 static const char *default_hotkey(void) {
 #ifdef _WIN32
-  return "Alt+V";
+  return "Ctrl+Shift";
 #else
   return "Meta+V";
 #endif
@@ -165,7 +168,172 @@ static int ask_yes_no(const char *prompt) {
   return answer[0] == 'y' || answer[0] == 'Y';
 }
 
-#if STT_ENABLE_DOWNLOAD
+#if STT_ENABLE_DOWNLOAD && defined(_WIN32)
+static wchar_t *utf8_to_wide(const char *text) {
+  int needed = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+  if (needed <= 0) return NULL;
+  wchar_t *wide = malloc((size_t)needed * sizeof(*wide));
+  if (!wide) return NULL;
+  if (MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, needed) <= 0) {
+    free(wide);
+    return NULL;
+  }
+  return wide;
+}
+
+static int download_url_to_file(const char *url, const char *path) {
+  int rc = -1;
+  wchar_t *url_w = utf8_to_wide(url);
+  URL_COMPONENTS parts;
+  wchar_t host[256];
+  wchar_t path_buf[2048];
+  wchar_t extra_buf[2048];
+  HINTERNET session = NULL;
+  HINTERNET connect = NULL;
+  HINTERNET request = NULL;
+  FILE *f = NULL;
+
+  if (!url_w) return -1;
+  memset(&parts, 0, sizeof(parts));
+  parts.dwStructSize = sizeof(parts);
+  parts.lpszHostName = host;
+  parts.dwHostNameLength = sizeof(host) / sizeof(host[0]);
+  parts.lpszUrlPath = path_buf;
+  parts.dwUrlPathLength = sizeof(path_buf) / sizeof(path_buf[0]);
+  parts.lpszExtraInfo = extra_buf;
+  parts.dwExtraInfoLength = sizeof(extra_buf) / sizeof(extra_buf[0]);
+
+  if (!WinHttpCrackUrl(url_w, 0, 0, &parts)) {
+    LOG_ERROR("model download failed to parse URL: %s error=%lu\n", url, GetLastError());
+    goto done;
+  }
+
+  size_t target_len = (size_t)parts.dwUrlPathLength + (size_t)parts.dwExtraInfoLength;
+  wchar_t *target = malloc((target_len + 1) * sizeof(*target));
+  if (!target) goto done;
+  memcpy(target, parts.lpszUrlPath, (size_t)parts.dwUrlPathLength * sizeof(*target));
+  memcpy(target + parts.dwUrlPathLength, parts.lpszExtraInfo, (size_t)parts.dwExtraInfoLength * sizeof(*target));
+  target[target_len] = L'\0';
+
+  session = WinHttpOpen(L"stt/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!session) {
+    LOG_ERROR("model download failed to open WinHTTP session: error=%lu\n", GetLastError());
+    free(target);
+    goto done;
+  }
+  DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+  WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &redirects, sizeof(redirects));
+
+  connect = WinHttpConnect(session, parts.lpszHostName, parts.nPort, 0);
+  if (!connect) {
+    LOG_ERROR("model download failed to connect: %s error=%lu\n", url, GetLastError());
+    free(target);
+    goto done;
+  }
+
+  request = WinHttpOpenRequest(connect,
+                               L"GET",
+                               target,
+                               NULL,
+                               WINHTTP_NO_REFERER,
+                               WINHTTP_DEFAULT_ACCEPT_TYPES,
+                               parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+  free(target);
+  if (!request) {
+    LOG_ERROR("model download failed to create request: %s error=%lu\n", url, GetLastError());
+    goto done;
+  }
+
+  if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+      !WinHttpReceiveResponse(request, NULL)) {
+    LOG_ERROR("model download request failed: %s error=%lu\n", url, GetLastError());
+    goto done;
+  }
+
+  DWORD status = 0;
+  DWORD status_len = sizeof(status);
+  if (WinHttpQueryHeaders(request,
+                          WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                          WINHTTP_HEADER_NAME_BY_INDEX,
+                          &status,
+                          &status_len,
+                          WINHTTP_NO_HEADER_INDEX) &&
+      (status < 200 || status >= 300)) {
+    LOG_ERROR("model download returned HTTP status %lu: %s\n", status, url);
+    goto done;
+  }
+
+  f = fopen(path, "wb");
+  if (!f) goto done;
+  for (;;) {
+    DWORD available = 0;
+    if (!WinHttpQueryDataAvailable(request, &available)) {
+      LOG_ERROR("model download failed while reading: %s error=%lu\n", url, GetLastError());
+      goto done;
+    }
+    if (available == 0) break;
+    char buf[65536];
+    while (available > 0) {
+      DWORD chunk = available > sizeof(buf) ? sizeof(buf) : available;
+      DWORD read = 0;
+      if (!WinHttpReadData(request, buf, chunk, &read)) {
+        LOG_ERROR("model download failed while streaming: %s error=%lu\n", url, GetLastError());
+        goto done;
+      }
+      if (read == 0) break;
+      if (fwrite(buf, 1, read, f) != read) goto done;
+      available -= read;
+    }
+  }
+  rc = 0;
+
+done:
+  if (f && fclose(f) != 0) rc = -1;
+  if (request) WinHttpCloseHandle(request);
+  if (connect) WinHttpCloseHandle(connect);
+  if (session) WinHttpCloseHandle(session);
+  free(url_w);
+  return rc;
+}
+
+static int download_one(const char *model_dir, const char *name) {
+  char url[1024];
+  snprintf(url, sizeof(url), "https://huggingface.co/%s/resolve/%s/%s", MODEL_REPO, MODEL_REVISION, name);
+  char *path = stt_path_join(model_dir, name);
+  if (!path) return -1;
+  char *partial = malloc(strlen(path) + 9);
+  if (!partial) {
+    free(path);
+    return -1;
+  }
+  sprintf(partial, "%s.partial", path);
+  if (download_url_to_file(url, partial) != 0 || rename(partial, path) != 0) {
+    LOG_ERROR("model download failed: %s\n", url);
+    remove(partial);
+    free(path);
+    free(partial);
+    return -1;
+  }
+  free(path);
+  free(partial);
+  return 0;
+}
+
+static int download_model(const char *model_dir) {
+  for (size_t i = 0; i < sizeof(MODEL_FILES) / sizeof(MODEL_FILES[0]); ++i) {
+    char *path = stt_path_join(model_dir, MODEL_FILES[i].name);
+    int exists = path && stt_file_exists(path);
+    free(path);
+    if (exists) {
+      LOG_INFO("Model file already exists: %s\n", MODEL_FILES[i].name);
+      continue;
+    }
+    LOG_INFO("Downloading model file: %s\n", MODEL_FILES[i].name);
+    if (download_one(model_dir, MODEL_FILES[i].name) != 0) return -1;
+  }
+  return 0;
+}
+#elif STT_ENABLE_DOWNLOAD
 static int download_one(const char *model_dir, const char *name) {
   char url[1024];
   snprintf(url, sizeof(url), "https://huggingface.co/%s/resolve/%s/%s", MODEL_REPO, MODEL_REVISION, name);
@@ -212,6 +380,13 @@ static int download_one(const char *model_dir, const char *name) {
 static int download_model(const char *model_dir) {
   if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) return -1;
   for (size_t i = 0; i < sizeof(MODEL_FILES) / sizeof(MODEL_FILES[0]); ++i) {
+    char *path = stt_path_join(model_dir, MODEL_FILES[i].name);
+    int exists = path && stt_file_exists(path);
+    free(path);
+    if (exists) {
+      LOG_INFO("Model file already exists: %s\n", MODEL_FILES[i].name);
+      continue;
+    }
     LOG_INFO("Downloading model file: %s\n", MODEL_FILES[i].name);
     if (download_one(model_dir, MODEL_FILES[i].name) != 0) {
       curl_global_cleanup();

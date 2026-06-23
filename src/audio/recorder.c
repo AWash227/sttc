@@ -31,6 +31,8 @@ struct SttRecorder {
   SttAudioSegment *pending_head;
   SttAudioSegment *pending_tail;
   unsigned int next_segment_index;
+  SttAudioMonitor monitor;
+  void *monitor_user;
   int owns_thread;
 };
 
@@ -154,6 +156,7 @@ static void *record_thread(void *arg) {
 
     size_t n = sizeof(chunk) / sizeof(chunk[0]);
     pthread_mutex_lock(&rec->mutex);
+    if (rec->monitor) rec->monitor(chunk, n, rec->monitor_user);
     remember_pre_roll(rec, chunk, n);
     if (rec->active) {
       if (append_recording_samples(rec, chunk, n) != 0) {
@@ -218,6 +221,14 @@ int stt_recorder_open(SttRecorder **out, const SttConfig *config) {
   LOG_DEBUG("audio monitor ready: fragment %.3fs\n", 256.0 / (double)STT_SAMPLE_RATE);
   *out = rec;
   return 0;
+}
+
+void stt_recorder_set_monitor(SttRecorder *rec, SttAudioMonitor monitor, void *user) {
+  if (!rec) return;
+  pthread_mutex_lock(&rec->mutex);
+  rec->monitor = monitor;
+  rec->monitor_user = user;
+  pthread_mutex_unlock(&rec->mutex);
 }
 
 void stt_recorder_close(SttRecorder *rec) {

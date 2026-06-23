@@ -88,10 +88,11 @@ int stt_mkdir_p(const char *path) {
 }
 
 int stt_file_exists(const char *path) {
-  struct stat st;
 #ifdef _WIN32
-  return stat(path, &st) == 0 && (st.st_mode & _S_IFREG);
+  struct _stat64 st;
+  return _stat64(path, &st) == 0 && (st.st_mode & _S_IFREG);
 #else
+  struct stat st;
   return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 #endif
 }

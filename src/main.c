@@ -6,7 +6,6 @@
 #include "stt/log.h"
 #include "stt/model.h"
 
-#include "audio/backend.h"
 #include "hotkey/backend.h"
 #include "text/backend.h"
 
@@ -17,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 typedef enum {
   TRANSCRIBE_JOB_HOTKEY,
@@ -61,15 +64,6 @@ typedef struct {
 } RunState;
 
 typedef struct {
-  const SttConfig *config;
-  TranscribeQueue *queue;
-  pthread_t thread;
-  atomic_int stop;
-  int started;
-  unsigned long long capture_seq;
-} AutoLogState;
-
-typedef struct {
   int16_t *samples;
   size_t cap;
   size_t len;
@@ -85,6 +79,20 @@ typedef struct {
   double floor;
   int initialized;
 } VadState;
+
+typedef struct {
+  const SttConfig *config;
+  TranscribeQueue *queue;
+  SttRecorder *recorder;
+  SampleRing pre;
+  SttAudioBuffer audio;
+  VadState vad;
+  int active;
+  int silence_chunks;
+  int trace_chunks;
+  int started;
+  unsigned long long capture_seq;
+} AutoLogState;
 
 static double samples_to_seconds(size_t samples) {
   return samples / (double)STT_SAMPLE_RATE;
@@ -243,88 +251,54 @@ static void enqueue_log_audio(AutoLogState *state, SttAudioBuffer *audio) {
   LOG_DEBUG("log: capture=%llu queued samples=%zu queue_depth=%zu\n", capture_id, samples, depth);
 }
 
-static void *auto_log_worker(void *arg) {
-  AutoLogState *state = arg;
-  SttAudioSource *source = NULL;
-  if (stt_audio_source_open(&source, state->config, "transcription log") != 0) {
-    return NULL;
-  }
-
-  SampleRing pre;
-  if (ring_init(&pre, (size_t)STT_SAMPLE_RATE * 350 / 1000) != 0) {
-    stt_audio_source_close(source);
-    return NULL;
-  }
-
+static void auto_log_on_audio(const int16_t *chunk, size_t n, void *user) {
+  AutoLogState *state = user;
   const int silence_chunks_to_stop = 45;
   const size_t max_samples = (size_t)STT_SAMPLE_RATE * (size_t)state->config->max_audio_sec;
-  int16_t chunk[256];
-  SttAudioBuffer audio;
-  stt_audio_buffer_init(&audio);
-  VadState vad = {0};
-  int active = 0;
-  int silence_chunks = 0;
-  int trace_chunks = 0;
-
-  LOG_INFO("Continuous log enabled: %s\n", state->config->log_path);
-  while (!atomic_load(&state->stop)) {
-    if (stt_audio_source_read(source, chunk, sizeof(chunk) / sizeof(chunk[0])) != 0) {
-      LOG_ERROR("log: %s read failed\n", stt_audio_backend_name());
-      break;
+  AudioLevel level = chunk_level(chunk, n);
+  int speech = vad_is_speech(&state->vad, level);
+  if (!state->active) {
+    ring_push(&state->pre, chunk, n);
+    if (!speech) {
+      vad_update_floor(&state->vad, level);
+      return;
     }
-
-    size_t n = sizeof(chunk) / sizeof(chunk[0]);
-    AudioLevel level = chunk_level(chunk, n);
-    int speech = vad_is_speech(&vad, level);
-    if (!active) {
-      ring_push(&pre, chunk, n);
-      if (!speech) {
-        vad_update_floor(&vad, level);
-        continue;
-      }
-      active = 1;
-      silence_chunks = 0;
-      stt_audio_buffer_free(&audio);
-      stt_audio_buffer_init(&audio);
-      append_ring_audio(&audio, &pre, max_samples);
-      LOG_DEBUG("log: speech_start avg=%d peak=%d floor=%.1f start_avg=%d start_peak=%d stop_avg=%d stop_peak=%d\n",
-                level.avg, level.peak, vad.floor,
-                vad_threshold(&vad, 3.5, 140), vad_threshold(&vad, 12.0, 900),
-                vad_threshold(&vad, 2.4, 110), vad_threshold(&vad, 8.0, 650));
-      continue;
-    }
-
-    append_audio(&audio, chunk, n, max_samples);
-    int silence = vad_is_silence(&vad, level);
-    if (silence) {
-      silence_chunks++;
-      vad_update_floor(&vad, level);
-    } else {
-      silence_chunks = 0;
-    }
-
-    if (stt_log_enabled(STT_LOG_TRACE) && ++trace_chunks % 64 == 0) {
-      LOG_TRACE("log: vad active=%d avg=%d peak=%d floor=%.1f speech=%d silence=%d silence_chunks=%d\n",
-                active, level.avg, level.peak, vad.floor, speech, silence, silence_chunks);
-    }
-    if (silence_chunks >= silence_chunks_to_stop || audio.len >= max_samples) {
-      const char *reason = audio.len >= max_samples ? "max_audio" : "silence";
-      LOG_DEBUG("log: speech_end reason=%s samples=%zu avg=%d peak=%d floor=%.1f silence_chunks=%d\n",
-                reason, audio.len, level.avg, level.peak, vad.floor, silence_chunks);
-      enqueue_log_audio(state, &audio);
-      active = 0;
-      silence_chunks = 0;
-    }
+    state->active = 1;
+    state->silence_chunks = 0;
+    stt_audio_buffer_free(&state->audio);
+    stt_audio_buffer_init(&state->audio);
+    append_ring_audio(&state->audio, &state->pre, max_samples);
+    LOG_DEBUG("log: speech_start avg=%d peak=%d floor=%.1f start_avg=%d start_peak=%d stop_avg=%d stop_peak=%d\n",
+              level.avg, level.peak, state->vad.floor,
+              vad_threshold(&state->vad, 3.5, 140), vad_threshold(&state->vad, 12.0, 900),
+              vad_threshold(&state->vad, 2.4, 110), vad_threshold(&state->vad, 8.0, 650));
+    return;
   }
 
-  if (active && audio.len > 0) enqueue_log_audio(state, &audio);
-  stt_audio_buffer_free(&audio);
-  ring_free(&pre);
-  stt_audio_source_close(source);
-  return NULL;
+  append_audio(&state->audio, chunk, n, max_samples);
+  int silence = vad_is_silence(&state->vad, level);
+  if (silence) {
+    state->silence_chunks++;
+    vad_update_floor(&state->vad, level);
+  } else {
+    state->silence_chunks = 0;
+  }
+
+  if (stt_log_enabled(STT_LOG_TRACE) && ++state->trace_chunks % 64 == 0) {
+    LOG_TRACE("log: vad active=%d avg=%d peak=%d floor=%.1f speech=%d silence=%d silence_chunks=%d\n",
+              state->active, level.avg, level.peak, state->vad.floor, speech, silence, state->silence_chunks);
+  }
+  if (state->silence_chunks >= silence_chunks_to_stop || state->audio.len >= max_samples) {
+    const char *reason = state->audio.len >= max_samples ? "max_audio" : "silence";
+    LOG_DEBUG("log: speech_end reason=%s samples=%zu avg=%d peak=%d floor=%.1f silence_chunks=%d\n",
+              reason, state->audio.len, level.avg, level.peak, state->vad.floor, state->silence_chunks);
+    enqueue_log_audio(state, &state->audio);
+    state->active = 0;
+    state->silence_chunks = 0;
+  }
 }
 
-static int auto_log_start(AutoLogState *state, const SttConfig *config, TranscribeQueue *queue) {
+static int auto_log_start(AutoLogState *state, const SttConfig *config, TranscribeQueue *queue, SttRecorder *recorder) {
   memset(state, 0, sizeof(*state));
   if (!config->log_path) return 0;
   FILE *f = fopen(config->log_path, "a");
@@ -335,19 +309,25 @@ static int auto_log_start(AutoLogState *state, const SttConfig *config, Transcri
   fclose(f);
   state->config = config;
   state->queue = queue;
-  atomic_init(&state->stop, 0);
-  if (pthread_create(&state->thread, NULL, auto_log_worker, state) != 0) {
-    LOG_ERROR("log: failed to start auto transcription thread\n");
+  state->recorder = recorder;
+  stt_audio_buffer_init(&state->audio);
+  if (ring_init(&state->pre, (size_t)STT_SAMPLE_RATE * 350 / 1000) != 0) {
+    stt_audio_buffer_free(&state->audio);
     return -1;
   }
+  stt_recorder_set_monitor(recorder, auto_log_on_audio, state);
   state->started = 1;
+  LOG_INFO("Continuous log enabled: %s\n", state->config->log_path);
   return 0;
 }
 
 static void auto_log_stop(AutoLogState *state) {
   if (!state->started) return;
-  atomic_store(&state->stop, 1);
-  pthread_join(state->thread, NULL);
+  stt_recorder_set_monitor(state->recorder, NULL, NULL);
+  if (state->active && state->audio.len > 0) enqueue_log_audio(state, &state->audio);
+  stt_audio_buffer_free(&state->audio);
+  ring_free(&state->pre);
+  state->started = 0;
 }
 
 static void *transcribe_worker(void *arg) {
@@ -600,6 +580,10 @@ static void on_hotkey(int pressed, void *user) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#endif
   SttConfig config;
   if (stt_parse_args(argc, argv, &config) != 0) {
     stt_print_usage(argv[0]);
@@ -630,7 +614,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   AutoLogState auto_log;
-  if (auto_log_start(&auto_log, &config, &queue) != 0) {
+  if (auto_log_start(&auto_log, &config, &queue, recorder) != 0) {
     transcribe_queue_stop(&queue);
     stt_recorder_close(recorder);
     stt_model_free(model);
