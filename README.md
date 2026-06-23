@@ -37,7 +37,7 @@ Install MSYS2, open the "MSYS2 MinGW x64" shell, then install build dependencies
 pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf mingw-w64-x86_64-portaudio mingw-w64-x86_64-fftw
 ```
 
-The Windows preset expects the ONNX Runtime package at `build/deps/onnxruntime-win-x64-1.27.0`. If it is in another location, pass `-DSTT_ORT_ROOT=/path/to/onnxruntime-win-x64-1.27.0`.
+The Windows preset expects the ONNX Runtime DirectML package at `build/deps/onnxruntime-directml-win-x64-1.24.4`. If it is in another location, pass `-DSTT_ORT_ROOT=/path/to/onnxruntime-package`.
 
 ```sh
 cmake --preset windows-x86-64

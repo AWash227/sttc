@@ -22,7 +22,7 @@
         "STT_ENABLE_CUDA": "OFF",
         "STT_ENABLE_DIRECTML": "ON",
         "STT_ENABLE_DOWNLOAD": "ON",
-        "STT_ORT_ROOT": "${sourceDir}/build/deps/onnxruntime-win-x64-1.27.0",
+        "STT_ORT_ROOT": "${sourceDir}/build/deps/onnxruntime-directml-win-x64-1.24.4",
         "STT_AUDIO_BACKEND": "portaudio",
         "STT_HOTKEY_BACKEND": "win32",
         "STT_TEXT_BACKEND": "win32"

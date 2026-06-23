@@ -89,8 +89,18 @@ endfunction()
 if(STT_ENABLE_ORT)
   stt_add_pkg(fftw3f)
   if(STT_ORT_ROOT)
-    list(APPEND STT_DEPS_INCLUDE_DIRS "${STT_ORT_ROOT}/include")
-    list(APPEND STT_DEPS_LIBRARY_DIRS "${STT_ORT_ROOT}/lib")
+    if(EXISTS "${STT_ORT_ROOT}/build/native/include")
+      list(APPEND STT_DEPS_INCLUDE_DIRS "${STT_ORT_ROOT}/build/native/include")
+    else()
+      list(APPEND STT_DEPS_INCLUDE_DIRS "${STT_ORT_ROOT}/include")
+    endif()
+    if(EXISTS "${STT_ORT_ROOT}/runtimes/win-x64/native")
+      list(APPEND STT_DEPS_LIBRARY_DIRS "${STT_ORT_ROOT}/runtimes/win-x64/native")
+      set(STT_ORT_DLL_DIR "${STT_ORT_ROOT}/runtimes/win-x64/native")
+    else()
+      list(APPEND STT_DEPS_LIBRARY_DIRS "${STT_ORT_ROOT}/lib")
+      set(STT_ORT_DLL_DIR "${STT_ORT_ROOT}/lib")
+    endif()
     list(APPEND STT_DEPS_LIBRARIES onnxruntime)
   else()
     stt_add_pkg(libonnxruntime)
@@ -196,10 +206,10 @@ if(WIN32)
   if(STT_ORT_ROOT)
     add_custom_command(TARGET stt POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${STT_ORT_ROOT}/lib/onnxruntime.dll"
+        "${STT_ORT_DLL_DIR}/onnxruntime.dll"
         "$<TARGET_FILE_DIR:stt>/onnxruntime.dll"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${STT_ORT_ROOT}/lib/onnxruntime_providers_shared.dll"
+        "${STT_ORT_DLL_DIR}/onnxruntime_providers_shared.dll"
         "$<TARGET_FILE_DIR:stt>/onnxruntime_providers_shared.dll")
   endif()
 endif()
