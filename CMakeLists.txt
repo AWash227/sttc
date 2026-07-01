@@ -110,6 +110,16 @@ else()
   list(APPEND STT_SOURCES src/infer_stub.c)
 endif()
 
+set(STT_HAVE_CUDA_TOOLKIT FALSE)
+if(STT_ENABLE_ORT AND STT_ENABLE_CUDA)
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    set(STT_HAVE_CUDA_TOOLKIT TRUE)
+  else()
+    message(STATUS "CUDA toolkit not found; decoder CUDA graph capture will be disabled at build time")
+  endif()
+endif()
+
 if(STT_ENABLE_DOWNLOAD AND NOT WIN32)
   stt_add_pkg(libcurl)
 endif()
@@ -172,9 +182,13 @@ target_compile_definitions(stt PRIVATE
   STT_ENABLE_OPENVINO=$<BOOL:${STT_ENABLE_OPENVINO}>
   STT_ENABLE_MIGRAPHX=$<BOOL:${STT_ENABLE_MIGRAPHX}>
   STT_ENABLE_XNNPACK=$<BOOL:${STT_ENABLE_XNNPACK}>
+  STT_HAVE_CUDA_TOOLKIT=$<BOOL:${STT_HAVE_CUDA_TOOLKIT}>
 )
 target_link_directories(stt PRIVATE ${STT_DEPS_LIBRARY_DIRS})
 target_link_libraries(stt PRIVATE ${STT_DEPS_LIBRARIES} Threads::Threads)
+if(STT_HAVE_CUDA_TOOLKIT)
+  target_link_libraries(stt PRIVATE CUDA::cudart)
+endif()
 if(NOT MSVC)
   target_link_libraries(stt PRIVATE m)
 endif()

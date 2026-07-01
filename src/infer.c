@@ -15,6 +15,10 @@
 #include <windows.h>
 #endif
 
+#if STT_HAVE_CUDA_TOOLKIT
+#include <cuda_runtime_api.h>
+#endif
+
 #define TDT_FEATURE_BINS 128
 #define TDT_ENCODER_DIM 1024
 #define TDT_STATE_LAYERS 2
@@ -29,12 +33,47 @@ typedef struct {
 } TdtVocab;
 
 typedef struct {
+  OrtIoBinding *binding;
+  OrtValue *inputs[5];
+  OrtValue *outputs[4];
+
+  /* Host-side scratch that decoder_step() writes fresh values into every
+   * frame. When not using CUDA graph capture, the bound input OrtValues wrap
+   * these buffers directly (zero copy). When using CUDA graph capture, these
+   * are staged into the device buffers below via cudaMemcpy before replay. */
+  float host_encoder_slice[TDT_ENCODER_DIM];
+  int32_t host_target;
+  int32_t host_target_length;
+  float host_state1[TDT_STATE_LAYERS * TDT_STATE_DIM];
+  float host_state2[TDT_STATE_LAYERS * TDT_STATE_DIM];
+
+  int use_cuda_graph;
+  void *dev_encoder_slice;
+  void *dev_target;
+  void *dev_target_length;
+  void *dev_state1;
+  void *dev_state2;
+
+  /* Output buffers are always host-resident; ORT copies device results back
+   * to these fixed addresses on every RunWithBinding call. */
+  float *out_logits;
+  size_t logits_len;
+  int32_t *out_prednet_lengths;
+  float *out_state1;
+  float *out_state2;
+} DecoderIo;
+
+typedef struct {
   const OrtApi *api;
   OrtEnv *env;
   OrtSessionOptions *options;
+  OrtSessionOptions *decoder_options;
   OrtSession *encoder;
   OrtSession *decoder;
   OrtMemoryInfo *memory;
+  OrtMemoryInfo *cuda_memory;
+  DecoderIo decoder_io;
+  int decoder_io_ready;
 } OrtTdt;
 
 typedef struct {
@@ -272,6 +311,7 @@ static int provider_status(OrtTdt *ort,
 }
 
 static int append_generic_provider(OrtTdt *ort,
+                                   OrtSessionOptions *options,
                                    SttInferProvider provider,
                                    const char *ort_provider_name,
                                    const char *option_key,
@@ -289,11 +329,12 @@ static int append_generic_provider(OrtTdt *ort,
   const char *keys[1] = {option_key};
   const char *values[1] = {option_value};
   size_t count = option_key && option_value ? 1 : 0;
-  OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider(ort->options, ort_provider_name, keys, values, count);
+  OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider(options, ort_provider_name, keys, values, count);
   return provider_status(ort, status, provider, explicit_request, ort_provider_name, selected_provider_out);
 }
 
 static int append_provider(OrtTdt *ort,
+                           OrtSessionOptions *options,
                            SttInferProvider provider,
                            const SttConfig *config,
                            int explicit_request,
@@ -317,34 +358,34 @@ static int append_provider(OrtTdt *ort,
     case STT_INFER_PROVIDER_CUDA: {
       const char *algo_name = NULL;
       OrtCudnnConvAlgoSearch algo_search = cudnn_algo_search_from_env(&algo_name);
-      OrtCUDAProviderOptions options = {
+      OrtCUDAProviderOptions cuda_options = {
         .device_id = device_id,
         .cudnn_conv_algo_search = algo_search,
         .gpu_mem_limit = SIZE_MAX,
         .arena_extend_strategy = 1,
         .do_copy_in_default_stream = 1,
       };
-      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_CUDA(ort->options, &options);
+      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_CUDA(options, &cuda_options);
       return provider_status(ort, status, provider, explicit_request, algo_name, selected_provider_out);
     }
     case STT_INFER_PROVIDER_MIGRAPHX: {
-      OrtMIGraphXProviderOptions options;
-      memset(&options, 0, sizeof(options));
-      options.device_id = device_id;
-      options.migraphx_mem_limit = SIZE_MAX;
-      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_MIGraphX(ort->options, &options);
+      OrtMIGraphXProviderOptions migx_options;
+      memset(&migx_options, 0, sizeof(migx_options));
+      migx_options.device_id = device_id;
+      migx_options.migraphx_mem_limit = SIZE_MAX;
+      OrtStatus *status = ort->api->SessionOptionsAppendExecutionProvider_MIGraphX(options, &migx_options);
       return provider_status(ort, status, provider, explicit_request, "MIGraphX", selected_provider_out);
     }
     case STT_INFER_PROVIDER_OPENVINO:
-      return append_generic_provider(ort, provider, "OpenVINO", NULL, NULL, explicit_request, selected_provider_out);
+      return append_generic_provider(ort, options, provider, "OpenVINO", NULL, NULL, explicit_request, selected_provider_out);
     case STT_INFER_PROVIDER_DIRECTML:
-      return append_generic_provider(ort, provider, "DML", NULL, NULL, explicit_request, selected_provider_out);
+      return append_generic_provider(ort, options, provider, "DML", NULL, NULL, explicit_request, selected_provider_out);
     case STT_INFER_PROVIDER_COREML:
-      return append_generic_provider(ort, provider, "CoreML", NULL, NULL, explicit_request, selected_provider_out);
+      return append_generic_provider(ort, options, provider, "CoreML", NULL, NULL, explicit_request, selected_provider_out);
     case STT_INFER_PROVIDER_XNNPACK: {
       char threads[16];
       snprintf(threads, sizeof(threads), "%d", config && config->threads > 0 ? config->threads : 1);
-      return append_generic_provider(ort, provider, "XNNPACK", "intra_op_num_threads", threads, explicit_request, selected_provider_out);
+      return append_generic_provider(ort, options, provider, "XNNPACK", "intra_op_num_threads", threads, explicit_request, selected_provider_out);
     }
     case STT_INFER_PROVIDER_AUTO:
     case STT_INFER_PROVIDER_CPU:
@@ -354,7 +395,35 @@ static int append_provider(OrtTdt *ort,
   return 0;
 }
 
-static int configure_providers(OrtTdt *ort, const SttConfig *config, const char **selected_provider_out) {
+#if STT_HAVE_CUDA_TOOLKIT
+/* Decoder-only: same CUDA device as append_provider's CUDA case, but through
+ * the V2 options object so enable_cuda_graph can be turned on. Only valid to
+ * call once append_provider() has already proven CUDA is usable. */
+static int append_cuda_provider_v2(OrtTdt *ort,
+                                   OrtSessionOptions *options,
+                                   int device_id,
+                                   int enable_cuda_graph,
+                                   const char **selected_provider_out) {
+  OrtCUDAProviderOptionsV2 *cuda_options = NULL;
+  if (ort_check(ort, ort->api->CreateCUDAProviderOptions(&cuda_options), "CreateCUDAProviderOptions") != 0) return -1;
+
+  char device_id_str[16];
+  snprintf(device_id_str, sizeof(device_id_str), "%d", device_id);
+  const char *keys[2] = {"device_id", "enable_cuda_graph"};
+  const char *values[2] = {device_id_str, enable_cuda_graph ? "1" : "0"};
+  OrtStatus *status = ort->api->UpdateCUDAProviderOptions(cuda_options, keys, values, enable_cuda_graph ? 2 : 1);
+  if (ort_check(ort, status, "UpdateCUDAProviderOptions") != 0) {
+    ort->api->ReleaseCUDAProviderOptions(cuda_options);
+    return -1;
+  }
+
+  status = ort->api->SessionOptionsAppendExecutionProvider_CUDA_V2(options, cuda_options);
+  ort->api->ReleaseCUDAProviderOptions(cuda_options);
+  return provider_status(ort, status, STT_INFER_PROVIDER_CUDA, 1, "CUDA_V2", selected_provider_out);
+}
+#endif
+
+static int configure_providers(OrtTdt *ort, OrtSessionOptions *options, const SttConfig *config, const char **selected_provider_out) {
   SttInferProvider requested = parse_provider(requested_provider_name(config));
   if (requested == STT_INFER_PROVIDER_UNKNOWN) {
     LOG_ERROR("infer: unknown provider=%s\n", requested_provider_name(config));
@@ -363,7 +432,7 @@ static int configure_providers(OrtTdt *ort, const SttConfig *config, const char 
 
   log_available_providers(ort);
   if (requested != STT_INFER_PROVIDER_AUTO) {
-    return append_provider(ort, requested, config, 1, selected_provider_out) < 0 ? -1 : 0;
+    return append_provider(ort, options, requested, config, 1, selected_provider_out) < 0 ? -1 : 0;
   }
 
   static const SttInferProvider auto_order[] = {
@@ -375,13 +444,39 @@ static int configure_providers(OrtTdt *ort, const SttConfig *config, const char 
     STT_INFER_PROVIDER_XNNPACK,
   };
   for (size_t i = 0; i < sizeof(auto_order) / sizeof(auto_order[0]); ++i) {
-    int rc = append_provider(ort, auto_order[i], config, 0, selected_provider_out);
+    int rc = append_provider(ort, options, auto_order[i], config, 0, selected_provider_out);
     if (rc < 0) return -1;
     if (rc > 0) return 0;
   }
   *selected_provider_out = "cpu";
   LOG_DEBUG("infer: provider=cpu configured detail=auto_fallback\n");
   return 0;
+}
+
+/* Configure the decoder's own session options for the provider already
+ * resolved against the encoder. CPU needs nothing. CUDA additionally turns
+ * on graph capture: the decoder loop calls Run() once per emitted token with
+ * identical shapes every time, which is exactly what CUDA graph replay is
+ * for. The encoder never takes this path -- its input shape varies with
+ * utterance length, so it cannot be graph-captured. */
+static int configure_decoder_provider(OrtTdt *ort,
+                                      OrtSessionOptions *decoder_options,
+                                      const SttConfig *config,
+                                      SttInferProvider resolved,
+                                      int *use_cuda_graph_out) {
+  *use_cuda_graph_out = 0;
+  if (resolved == STT_INFER_PROVIDER_CPU) return 0;
+#if STT_HAVE_CUDA_TOOLKIT
+  if (resolved == STT_INFER_PROVIDER_CUDA) {
+    int device_id = config ? config->device_id : 0;
+    const char *selected = NULL;
+    if (append_cuda_provider_v2(ort, decoder_options, device_id, 1, &selected) < 0) return -1;
+    *use_cuda_graph_out = 1;
+    return 0;
+  }
+#endif
+  const char *selected = NULL;
+  return append_provider(ort, decoder_options, resolved, config, 1, &selected) < 0 ? -1 : 0;
 }
 
 static void tdt_vocab_free(TdtVocab *vocab) {
@@ -489,11 +584,33 @@ fail:
   return -1;
 }
 
+static void decoder_io_free(const OrtApi *api, DecoderIo *io) {
+  if (!api || !io) return;
+  if (io->binding) api->ReleaseIoBinding(io->binding);
+  for (size_t i = 0; i < 5; ++i) if (io->inputs[i]) api->ReleaseValue(io->inputs[i]);
+  for (size_t i = 0; i < 4; ++i) if (io->outputs[i]) api->ReleaseValue(io->outputs[i]);
+  free(io->out_logits);
+  free(io->out_prednet_lengths);
+  free(io->out_state1);
+  free(io->out_state2);
+#if STT_HAVE_CUDA_TOOLKIT
+  if (io->dev_encoder_slice) cudaFree(io->dev_encoder_slice);
+  if (io->dev_target) cudaFree(io->dev_target);
+  if (io->dev_target_length) cudaFree(io->dev_target_length);
+  if (io->dev_state1) cudaFree(io->dev_state1);
+  if (io->dev_state2) cudaFree(io->dev_state2);
+#endif
+  memset(io, 0, sizeof(*io));
+}
+
 static void ort_tdt_free(OrtTdt *ort) {
   if (!ort || !ort->api) return;
+  decoder_io_free(ort->api, &ort->decoder_io);
+  if (ort->cuda_memory) ort->api->ReleaseMemoryInfo(ort->cuda_memory);
   if (ort->memory) ort->api->ReleaseMemoryInfo(ort->memory);
   if (ort->decoder) ort->api->ReleaseSession(ort->decoder);
   if (ort->encoder) ort->api->ReleaseSession(ort->encoder);
+  if (ort->decoder_options) ort->api->ReleaseSessionOptions(ort->decoder_options);
   if (ort->options) ort->api->ReleaseSessionOptions(ort->options);
   if (ort->env) ort->api->ReleaseEnv(ort->env);
   memset(ort, 0, sizeof(*ort));
@@ -507,6 +624,90 @@ static void tdt_runtime_free(TdtRuntime *runtime) {
   free(runtime->variant);
   free(runtime->provider);
   memset(runtime, 0, sizeof(*runtime));
+}
+
+static int decoder_io_create_tensor(OrtTdt *ort, OrtMemoryInfo *mem_info, void *data, size_t bytes,
+                                    const int64_t *shape, size_t rank, ONNXTensorElementDataType type,
+                                    OrtValue **out) {
+  return ort_check(ort, ort->api->CreateTensorWithDataAsOrtValue(mem_info, data, bytes, shape, rank, type, out),
+                   "CreateTensorWithDataAsOrtValue");
+}
+
+/* Allocates the decoder's input/output tensors once and binds them via
+ * OrtIoBinding so every subsequent decode step reuses the same OrtValues and
+ * backing memory instead of allocating fresh ones per frame. When
+ * use_cuda_graph is set, inputs live in device memory (required for CUDA
+ * graph capture -- see append_cuda_provider_v2) and decoder_step() stages
+ * new values into them with cudaMemcpy before each replay. */
+static int decoder_io_init(OrtTdt *ort, size_t vocab_count, int use_cuda_graph, int device_id) {
+  (void)use_cuda_graph;
+  (void)device_id;
+  DecoderIo *io = &ort->decoder_io;
+  memset(io, 0, sizeof(*io));
+  io->use_cuda_graph = use_cuda_graph;
+  io->logits_len = vocab_count + TDT_DURATION_COUNT;
+  io->host_target_length = 1;
+
+  int64_t encoder_shape[] = {1, TDT_ENCODER_DIM, 1};
+  int64_t target_shape[] = {1, 1};
+  int64_t target_length_shape[] = {1};
+  int64_t state_shape[] = {TDT_STATE_LAYERS, 1, TDT_STATE_DIM};
+  int64_t logits_shape[] = {1, 1, 1, (int64_t)io->logits_len};
+  int64_t prednet_shape[] = {1};
+
+  io->out_logits = calloc(io->logits_len, sizeof(float));
+  io->out_prednet_lengths = calloc(1, sizeof(int32_t));
+  io->out_state1 = calloc(TDT_STATE_LAYERS * TDT_STATE_DIM, sizeof(float));
+  io->out_state2 = calloc(TDT_STATE_LAYERS * TDT_STATE_DIM, sizeof(float));
+  if (!io->out_logits || !io->out_prednet_lengths || !io->out_state1 || !io->out_state2) return -1;
+
+#if STT_HAVE_CUDA_TOOLKIT
+  if (use_cuda_graph) {
+    size_t state_bytes = TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(float);
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    if (cudaMalloc(&io->dev_encoder_slice, TDT_ENCODER_DIM * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&io->dev_target, sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&io->dev_target_length, sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&io->dev_state1, state_bytes) != cudaSuccess) return -1;
+    if (cudaMalloc(&io->dev_state2, state_bytes) != cudaSuccess) return -1;
+    if (cudaMemset(io->dev_state1, 0, state_bytes) != cudaSuccess) return -1;
+    if (cudaMemset(io->dev_state2, 0, state_bytes) != cudaSuccess) return -1;
+    int32_t one = 1, zero_target = 0;
+    if (cudaMemcpy(io->dev_target_length, &one, sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(io->dev_target, &zero_target, sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+
+    if (ort_check(ort, ort->api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, device_id, OrtMemTypeDefault, &ort->cuda_memory), "CreateMemoryInfo cuda") != 0) return -1;
+
+    if (decoder_io_create_tensor(ort, ort->cuda_memory, io->dev_encoder_slice, TDT_ENCODER_DIM * sizeof(float), encoder_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[0]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->cuda_memory, io->dev_target, sizeof(int32_t), target_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &io->inputs[1]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->cuda_memory, io->dev_target_length, sizeof(int32_t), target_length_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &io->inputs[2]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->cuda_memory, io->dev_state1, state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[3]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->cuda_memory, io->dev_state2, state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[4]) != 0) return -1;
+  } else
+#endif
+  {
+    if (decoder_io_create_tensor(ort, ort->memory, io->host_encoder_slice, sizeof(io->host_encoder_slice), encoder_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[0]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->memory, &io->host_target, sizeof(io->host_target), target_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &io->inputs[1]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->memory, &io->host_target_length, sizeof(io->host_target_length), target_length_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &io->inputs[2]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->memory, io->host_state1, sizeof(io->host_state1), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[3]) != 0) return -1;
+    if (decoder_io_create_tensor(ort, ort->memory, io->host_state2, sizeof(io->host_state2), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->inputs[4]) != 0) return -1;
+  }
+
+  if (decoder_io_create_tensor(ort, ort->memory, io->out_logits, io->logits_len * sizeof(float), logits_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->outputs[0]) != 0) return -1;
+  if (decoder_io_create_tensor(ort, ort->memory, io->out_prednet_lengths, sizeof(int32_t), prednet_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &io->outputs[1]) != 0) return -1;
+  if (decoder_io_create_tensor(ort, ort->memory, io->out_state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->outputs[2]) != 0) return -1;
+  if (decoder_io_create_tensor(ort, ort->memory, io->out_state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &io->outputs[3]) != 0) return -1;
+
+  if (ort_check(ort, ort->api->CreateIoBinding(ort->decoder, &io->binding), "CreateIoBinding") != 0) return -1;
+  static const char *input_names[] = {"encoder_outputs", "targets", "target_length", "input_states_1", "input_states_2"};
+  static const char *output_names[] = {"outputs", "prednet_lengths", "output_states_1", "output_states_2"};
+  for (size_t i = 0; i < 5; ++i) {
+    if (ort_check(ort, ort->api->BindInput(io->binding, input_names[i], io->inputs[i]), "BindInput") != 0) return -1;
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    if (ort_check(ort, ort->api->BindOutput(io->binding, output_names[i], io->outputs[i]), "BindOutput") != 0) return -1;
+  }
+  return 0;
 }
 
 #ifdef _WIN32
@@ -529,6 +730,7 @@ static int ort_tdt_init(OrtTdt *ort,
                         const char *variant,
                         const char *encoder_file,
                         const char *decoder_file,
+                        size_t vocab_count,
                         const char **selected_provider_out) {
   long long start_ms = stt_now_ms();
   memset(ort, 0, sizeof(*ort));
@@ -548,21 +750,31 @@ static int ort_tdt_init(OrtTdt *ort,
   LOG_DEBUG("infer: tdt_variant=%s encoder_file=%s decoder_file=%s\n", variant, encoder_file, decoder_file);
 
   if (ort_check(ort, ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "stt", &ort->env), "CreateEnv") != 0) goto fail;
-  if (ort_check(ort, ort->api->CreateSessionOptions(&ort->options), "CreateSessionOptions") != 0) goto fail;
   int threads = config && config->threads > 0 ? config->threads : 1;
+
+  if (ort_check(ort, ort->api->CreateSessionOptions(&ort->options), "CreateSessionOptions") != 0) goto fail;
   ort_check(ort, ort->api->SetIntraOpNumThreads(ort->options, threads), "SetIntraOpNumThreads");
   ort_check(ort, ort->api->SetSessionGraphOptimizationLevel(ort->options, ORT_ENABLE_ALL), "SetSessionGraphOptimizationLevel");
-  if (configure_providers(ort, config, selected_provider_out) != 0) goto fail;
+  if (configure_providers(ort, ort->options, config, selected_provider_out) != 0) goto fail;
+  SttInferProvider resolved_provider = parse_provider(*selected_provider_out);
+
+  if (ort_check(ort, ort->api->CreateSessionOptions(&ort->decoder_options), "CreateSessionOptions decoder") != 0) goto fail;
+  ort_check(ort, ort->api->SetIntraOpNumThreads(ort->decoder_options, threads), "SetIntraOpNumThreads decoder");
+  ort_check(ort, ort->api->SetSessionGraphOptimizationLevel(ort->decoder_options, ORT_ENABLE_ALL), "SetSessionGraphOptimizationLevel decoder");
+  int use_cuda_graph = 0;
+  if (configure_decoder_provider(ort, ort->decoder_options, config, resolved_provider, &use_cuda_graph) != 0) goto fail;
+
 #ifdef _WIN32
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path_w, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
-  if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path_w, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
+  if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path_w, ort->decoder_options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
 #else
   if (ort_check(ort, ort->api->CreateSession(ort->env, encoder_path, ort->options, &ort->encoder), "CreateSession encoder") != 0) goto fail;
-  if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
+  if (ort_check(ort, ort->api->CreateSession(ort->env, decoder_path, ort->decoder_options, &ort->decoder), "CreateSession decoder") != 0) goto fail;
 #endif
   if (ort_check(ort, ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->memory), "CreateCpuMemoryInfo") != 0) goto fail;
-  LOG_DEBUG("infer: ort_init done elapsed_ms=%lld provider=%s threads=%d device_id=%d\n",
-            stt_now_ms() - start_ms, *selected_provider_out, threads, config ? config->device_id : 0);
+  if (decoder_io_init(ort, vocab_count, use_cuda_graph, config ? config->device_id : 0) != 0) goto fail;
+  LOG_DEBUG("infer: ort_init done elapsed_ms=%lld provider=%s threads=%d device_id=%d cuda_graph=%d\n",
+            stt_now_ms() - start_ms, *selected_provider_out, threads, config ? config->device_id : 0, use_cuda_graph);
 
   free(encoder_path);
   free(decoder_path);
@@ -624,7 +836,7 @@ static int tdt_runtime_get(const char *model_dir, const SttConfig *config, TdtRu
   }
   free(vocab_path);
   const char *selected_provider = "cpu";
-  if (ort_tdt_init(&g_tdt_runtime.ort, config, model_dir, variant, encoder_file, decoder_file, &selected_provider) != 0) {
+  if (ort_tdt_init(&g_tdt_runtime.ort, config, model_dir, variant, encoder_file, decoder_file, g_tdt_runtime.vocab.count, &selected_provider) != 0) {
     tdt_runtime_free(&g_tdt_runtime);
     return -1;
   }
@@ -708,50 +920,54 @@ static int decoder_step(OrtTdt *ort,
                         float *next_state2,
                         int *token_out,
                         int *duration_out) {
-  float encoder_slice[TDT_ENCODER_DIM];
-  for (size_t d = 0; d < TDT_ENCODER_DIM; ++d) encoder_slice[d] = encoder[d * encoded_len + frame];
+  DecoderIo *io = &ort->decoder_io;
+  for (size_t d = 0; d < TDT_ENCODER_DIM; ++d) io->host_encoder_slice[d] = encoder[d * encoded_len + frame];
+  io->host_target = target;
+  memcpy(io->host_state1, state1, sizeof(io->host_state1));
+  memcpy(io->host_state2, state2, sizeof(io->host_state2));
 
-  int32_t target_length = 1;
-  int64_t encoder_shape[] = {1, TDT_ENCODER_DIM, 1};
-  int64_t target_shape[] = {1, 1};
-  int64_t target_length_shape[] = {1};
-  int64_t state_shape[] = {TDT_STATE_LAYERS, 1, TDT_STATE_DIM};
-  OrtValue *inputs[5] = {NULL, NULL, NULL, NULL, NULL};
-  OrtValue *outputs[4] = {NULL, NULL, NULL, NULL};
-  const char *input_names[] = {"encoder_outputs", "targets", "target_length", "input_states_1", "input_states_2"};
-  const char *output_names[] = {"outputs", "prednet_lengths", "output_states_1", "output_states_2"};
-  int rc = -1;
+#if STT_HAVE_CUDA_TOOLKIT
+  if (io->use_cuda_graph) {
+    if (cudaMemcpy(io->dev_encoder_slice, io->host_encoder_slice, sizeof(io->host_encoder_slice), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(io->dev_target, &io->host_target, sizeof(io->host_target), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(io->dev_state1, io->host_state1, sizeof(io->host_state1), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(io->dev_state2, io->host_state2, sizeof(io->host_state2), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    /* target_length is always 1 and was written once during decoder_io_init. */
+  }
+#endif
+  /* The bound input OrtValues wrap host_encoder_slice/host_target/host_state1/
+   * host_state2 directly (see decoder_io_init), so their data is already fresh
+   * after the writes above. But ORT's IoBinding does not notice in-place writes
+   * to an already-bound CPU OrtValue on a GPU provider -- the host->device
+   * staging copy it performs is tied to the BindInput() call itself, not to
+   * RunWithBinding(). Re-bind every step so each step's data actually reaches
+   * the provider; this is still far cheaper than recreating OrtValues, since it
+   * just re-registers the same pointers. Skipped in CUDA graph mode, where
+   * inputs are device-resident already and rebinding would defeat capture. */
+  if (!io->use_cuda_graph) {
+    static const char *input_names[] = {"encoder_outputs", "targets", "target_length", "input_states_1", "input_states_2"};
+    for (size_t i = 0; i < 5; ++i) {
+      if (ort_check(ort, ort->api->BindInput(io->binding, input_names[i], io->inputs[i]), "BindInput") != 0) return -1;
+    }
+  }
 
-  if (make_tensor(ort, encoder_slice, sizeof(encoder_slice), encoder_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inputs[0]) != 0) goto done;
-  if (make_tensor(ort, &target, sizeof(target), target_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &inputs[1]) != 0) goto done;
-  if (make_tensor(ort, &target_length, sizeof(target_length), target_length_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &inputs[2]) != 0) goto done;
-  if (make_tensor(ort, (void *)state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*state1), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inputs[3]) != 0) goto done;
-  if (make_tensor(ort, (void *)state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*state2), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inputs[4]) != 0) goto done;
-  if (ort_check(ort, ort->api->Run(ort->decoder, NULL, input_names, (const OrtValue *const *)inputs, 5, output_names, 4, outputs), "Run decoder") != 0) goto done;
+  /* Required with IoBinding on stream-based providers like CUDA: RunWithBinding
+   * does not give the same implicit host-visible-on-return guarantee that the
+   * plain Run() API does. Without these, host reads/writes of bound buffers can
+   * race the provider's stream. Cheap no-ops on providers that don't need them. */
+  if (ort_check(ort, ort->api->SynchronizeBoundInputs(io->binding), "SynchronizeBoundInputs") != 0) return -1;
+  if (ort_check(ort, ort->api->RunWithBinding(ort->decoder, NULL, io->binding), "RunWithBinding decoder") != 0) return -1;
+  if (ort_check(ort, ort->api->SynchronizeBoundOutputs(io->binding), "SynchronizeBoundOutputs") != 0) return -1;
 
-  float *logits = NULL;
-  if (get_tensor_data(ort, outputs[0], &logits) != 0) goto done;
-  int token = argmax(logits, vocab->count);
-  int duration = argmax(logits + vocab->count, TDT_DURATION_COUNT);
+  int token = argmax(io->out_logits, vocab->count);
+  int duration = argmax(io->out_logits + vocab->count, TDT_DURATION_COUNT);
   if (token != vocab->blank_id) {
-    float *out_state1 = NULL;
-    float *out_state2 = NULL;
-    if (get_tensor_data(ort, outputs[2], &out_state1) != 0) goto done;
-    if (get_tensor_data(ort, outputs[3], &out_state2) != 0) goto done;
-    memcpy(next_state1, out_state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state1));
-    memcpy(next_state2, out_state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state2));
+    memcpy(next_state1, io->out_state1, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state1));
+    memcpy(next_state2, io->out_state2, TDT_STATE_LAYERS * TDT_STATE_DIM * sizeof(*next_state2));
   }
   *token_out = token;
   *duration_out = duration;
-  rc = 0;
-
-done:
-  for (size_t i = 0; i < 5; ++i) if (inputs[i]) ort->api->ReleaseValue(inputs[i]);
-  if (outputs[0]) ort->api->ReleaseValue(outputs[0]);
-  if (outputs[1]) ort->api->ReleaseValue(outputs[1]);
-  if (outputs[2]) ort->api->ReleaseValue(outputs[2]);
-  if (outputs[3]) ort->api->ReleaseValue(outputs[3]);
-  return rc;
+  return 0;
 }
 
 static int tdt_greedy_decode_onnx(OrtTdt *ort, const TdtVocab *vocab, OrtValue *encoded_value, int64_t encoded_len, int **ids_out, size_t *id_count_out, DecodeStats *stats) {
