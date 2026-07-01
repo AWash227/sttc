@@ -55,6 +55,8 @@ int stt_parse_args(int argc, char **argv, SttConfig *config) {
       config->dry_run = 1;
     } else if (strcmp(argv[i], "--print") == 0) {
       config->print_only = 1;
+    } else if (argv[i][0] != '-' && !config->input_file) {
+      config->input_file = argv[i];
     } else {
       return -1;
     }
@@ -67,6 +69,10 @@ void stt_print_usage(const char *argv0) {
           "usage:\n"
           "  %s [run] [--model-dir DIR] [--log FILE] [--type-delay-ms N] [--max-audio-sec N] [--pre-roll-ms N] [--post-roll-ms N]\n"
           "     [--infer-provider auto|cpu|cuda|directml|coreml|openvino|migraphx|xnnpack] [--device-id N] [--threads N]\n"
-          "     [--model-variant auto|fp32|int8] [--dry-run|--print]\n",
-          argv0);
+          "     [--model-variant auto|fp32|int8] [--dry-run|--print]\n"
+          "  %s FILE.wav [options...]\n"
+          "\n"
+          "  Passing a bare file path transcribes that 16-bit PCM WAV file (mono or stereo, %d Hz) and prints the\n"
+          "  result to stdout, instead of listening for the hotkey.\n",
+          argv0, argv0, STT_SAMPLE_RATE);
 }

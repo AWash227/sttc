@@ -6,6 +6,7 @@
 typedef struct {
   const char *model_dir;
   const char *log_path;
+  const char *input_file;
   const char *infer_provider;
   const char *model_variant;
   int type_delay_ms;

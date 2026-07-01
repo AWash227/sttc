@@ -47,6 +47,7 @@ set(STT_SOURCES
   src/log.c
   src/main.c
   src/model.c
+  src/wav.c
 )
 set(STT_DEPS_CFLAGS_OTHER "")
 set(STT_DEPS_INCLUDE_DIRS "")
@@ -253,6 +254,13 @@ if(BUILD_TESTING)
   target_include_directories(model_tests PRIVATE include)
   stt_enable_warnings(model_tests)
   add_test(NAME model_tests COMMAND model_tests)
+
+  add_executable(wav_tests tests/wav_tests.c src/wav.c src/audio/recorder.c src/audio/none.c src/log.c)
+  target_compile_definitions(wav_tests PRIVATE STT_TESTING)
+  target_include_directories(wav_tests PRIVATE include)
+  stt_enable_warnings(wav_tests)
+  target_link_libraries(wav_tests PRIVATE Threads::Threads)
+  add_test(NAME wav_tests COMMAND wav_tests)
 
   add_executable(app_tests tests/app_tests.c src/app.c src/fs.c src/log.c)
   target_compile_definitions(app_tests PRIVATE STT_ENABLE_DOWNLOAD=0)

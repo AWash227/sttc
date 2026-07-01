@@ -5,6 +5,7 @@
 #include "stt/infer.h"
 #include "stt/log.h"
 #include "stt/model.h"
+#include "stt/wav.h"
 
 #include "hotkey/backend.h"
 #include "text/backend.h"
@@ -579,6 +580,42 @@ static void on_hotkey(int pressed, void *user) {
            capture_id, stt_now_ms() - capture_start_ms, commit_ms, depth);
 }
 
+/* One-shot mode: transcribe a WAV file and print the result, skipping the
+ * hotkey/recorder/auto-log machinery entirely. */
+static int run_file_mode(SttConfig *config) {
+  SttModel *model = NULL;
+  if (stt_model_load(&model, config->model_dir) != 0) return 1;
+
+  long long warmup_start_ms = stt_now_ms();
+  int warmup_rc = stt_transcribe_warmup(model, config);
+  LOG_DEBUG("run: file warmup rc=%d elapsed_ms=%lld\n", warmup_rc, stt_now_ms() - warmup_start_ms);
+  if (warmup_rc != 0) {
+    stt_model_free(model);
+    return 1;
+  }
+
+  SttAudioBuffer audio;
+  if (stt_wav_read(config->input_file, &audio) != 0) {
+    stt_model_free(model);
+    return 1;
+  }
+
+  char *text = NULL;
+  long long start_ms = stt_now_ms();
+  int rc = stt_transcribe(model, &audio, config, &text);
+  LOG_DEBUG("run: file=%s transcribe rc=%d elapsed_ms=%lld\n", config->input_file, rc, stt_now_ms() - start_ms);
+  stt_audio_buffer_free(&audio);
+  stt_model_free(model);
+  if (rc != 0) return 1;
+
+  if (text && text[0]) {
+    printf("%s\n", text);
+    fflush(stdout);
+  }
+  free(text);
+  return 0;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
   SetConsoleOutputCP(CP_UTF8);
@@ -590,6 +627,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   if (stt_app_prepare(&config) != 0) return 1;
+
+  if (config.input_file) return run_file_mode(&config);
 
   SttModel *model = NULL;
   if (stt_model_load(&model, config.model_dir) != 0) return 1;

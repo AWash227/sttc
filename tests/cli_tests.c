@@ -43,9 +43,25 @@ static void test_invalid_int(void) {
   assert(stt_parse_args((int)(sizeof(argv) / sizeof(argv[0])), argv, &config) != 0);
 }
 
+static void test_positional_file(void) {
+  char *argv[] = {"stt", "recording.wav", "--print"};
+  SttConfig config;
+  assert(stt_parse_args((int)(sizeof(argv) / sizeof(argv[0])), argv, &config) == 0);
+  assert(strcmp(config.input_file, "recording.wav") == 0);
+  assert(config.print_only == 1);
+}
+
+static void test_rejects_second_positional(void) {
+  char *argv[] = {"stt", "a.wav", "b.wav"};
+  SttConfig config;
+  assert(stt_parse_args((int)(sizeof(argv) / sizeof(argv[0])), argv, &config) != 0);
+}
+
 int main(void) {
   test_defaults();
   test_provider_flags();
   test_invalid_int();
+  test_positional_file();
+  test_rejects_second_positional();
   return 0;
 }

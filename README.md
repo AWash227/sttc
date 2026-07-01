@@ -12,6 +12,7 @@ Implemented:
 - Windows x86-64 build: PortAudio capture, `Ctrl+Shift`, Win32 text typing, ONNX Runtime inference, first-run download, bundled runtime DLLs.
 - Runtime provider preference: `auto`, `cpu`, `cuda`, `directml`, `coreml`, `openvino`, `migraphx`, `xnnpack`.
 - TDT greedy decoding for token logits plus duration logits.
+- File mode: `stt recording.wav` transcribes a WAV file to stdout instead of listening for the hotkey.
 
 Not complete yet:
 
@@ -82,6 +83,13 @@ Runtime inference controls:
 ```
 
 `auto` tries enabled providers in build order and falls back to CPU. An explicit non-CPU provider fails if it is not enabled or unavailable in the installed ONNX Runtime package.
+
+Transcribe a file instead of listening for the hotkey by passing a bare WAV path (16-bit PCM, mono or stereo, 16000 Hz); the result is printed to stdout and `stt` exits instead of starting the hotkey loop:
+
+```sh
+./build/linux-x86-64/stt recording.wav
+./build/linux-x86-64/stt recording.wav --infer-provider cuda
+```
 
 On Linux, `stt` grabs `/dev/input/by-id/*-event-kbd` and creates a `/dev/uinput` passthrough keyboard so `Meta+V` works even when virt-manager has focus. If automatic keyboard discovery is wrong, set:
 
